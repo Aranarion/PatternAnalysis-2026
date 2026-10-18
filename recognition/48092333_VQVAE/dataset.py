@@ -31,8 +31,8 @@ def split_paths(data_root=DATA_ROOT):
         folder = os.path.join(data_root, folder)
         paths[split] = sorted(os.path.join(folder, f) for f in os.listdir(folder) if ".nii" in f)
     patients = [{patient_id(p) for p in ps} for ps in paths.values()]
-    assert not (patients[0] & patients[1] or patients[0] & patients[2] or patients[1] & patients[2]), \
-        "patient leakage between splits"
+    if patients[0] & patients[1] or patients[0] & patients[2] or patients[1] & patients[2]:
+        raise ValueError("patient leakage between splits")
     return paths
 
 
@@ -85,12 +85,11 @@ def get_datasets(data_root=DATA_ROOT, max_slices=None, augment=False, splits=tup
     generator = torch.Generator().manual_seed(seed)
     datasets = {}
     for split, paths in split_paths(data_root).items():
-        if split not in splits:
-            continue
         if max_slices and len(paths) > max_slices:
             keep = torch.randperm(len(paths), generator=generator)[:max_slices].sort().values
             paths = [paths[i] for i in keep]
-        datasets[split] = HipMRISlices(paths, augment and split == "train")
+        if split in splits:
+            datasets[split] = HipMRISlices(paths, augment and split == "train")
     return datasets
 
 

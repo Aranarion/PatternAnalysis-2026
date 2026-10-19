@@ -84,6 +84,7 @@ def parse_args():
     p.add_argument("--vqvae-ckpt")
     p.add_argument("--prior-dim", type=int, default=128)
     p.add_argument("--prior-layers", type=int, default=15)
+    p.add_argument("--save-epochs", type=int, nargs="*", default=[], help="also save checkpoints at these epochs")
     return p.parse_args()
 
 
@@ -162,10 +163,13 @@ def fit(model, config, loaders, step, args, extra):
                   **{f"val_{k}": v for k, v in val.items()}, "epoch_s": time.time() - t0, **stats}
         history.append(record)
         print(" ".join(f"{k}={v:.4g}" for k, v in record.items() if v is not None), flush=True)
+        ckpt = {"kind": args.model, "config": config, "state_dict": model.state_dict(),
+                "epoch": epoch, "args": vars(args), **extra}
         if val["loss"] < best:
             best = val["loss"]
-            torch.save({"kind": args.model, "config": config, "state_dict": model.state_dict(),
-                        "epoch": epoch, "args": vars(args), **extra}, path)
+            torch.save(ckpt, path)
+        if epoch in args.save_epochs:
+            torch.save(ckpt, os.path.join(out_dir, f"epoch_{epoch}.pt"))
 
     model, ckpt = load_model(path, DEVICE)
     ckpt["test"] = run_epoch(model, loaders["test"], step)

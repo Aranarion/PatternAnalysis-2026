@@ -174,6 +174,29 @@ def write_markdown(m, path):
 
 
 @torch.no_grad()
+def audit_prior(args):
+    """Memorisation audit of samples from one prior checkpoint (e.g. an over-trained epoch)."""
+    vqvae, ckpt = load_model(os.path.join(args.out_dir, "vqvae", "best.pt"), DEVICE)
+    prior, prior_ckpt = load_model(args.prior_ckpt, DEVICE)
+    a = ckpt["args"]
+    data = get_datasets(a["data_root"], a["max_slices"], splits=("train", "test"), seed=a["seed"])
+    train, test = data["train"].images, data["test"].images
+    threshold = torch.quantile(nearest_ssim(test, train)[0], 0.99).item()
+    generator = torch.Generator(device=DEVICE).manual_seed(args.seed)
+    sizes = [min(args.batch_size, args.num_samples - i) for i in range(0, args.num_samples, args.batch_size)]
+    codes = torch.cat([prior.sample(k, prior_ckpt["grid_shape"], DEVICE, args.temperature, generator).cpu()
+                       for k in sizes])
+    samples = batched(vqvae.decode_indices, codes)
+    nn_train = nearest_ssim(samples, train)[0]
+    result = {"prior_ckpt": args.prior_ckpt, "epoch": prior_ckpt["epoch"], "num_samples": args.num_samples,
+              "memorisation_threshold": threshold, **generation_stats(nn_train, samples, threshold)}
+    os.makedirs(os.path.join(args.out_dir, "predict"), exist_ok=True)
+    with open(os.path.join(args.out_dir, "predict", f"memorisation_epoch_{prior_ckpt['epoch']}.json"), "w") as f:
+        json.dump(result, f, indent=2)
+    print(json.dumps(result, indent=2))
+
+
+@torch.no_grad()
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--out-dir", default="outputs")
@@ -182,8 +205,11 @@ def main():
     p.add_argument("--temperature", type=float, default=1.0)
     p.add_argument("--no-fid", action="store_true")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--prior-ckpt", help="only run the memorisation audit for this prior checkpoint")
     args = p.parse_args()
     torch.manual_seed(args.seed)
+    if args.prior_ckpt:
+        return audit_prior(args)
     out = os.path.join(args.out_dir, "predict")
     figs = os.path.join(out, "figures")
     os.makedirs(figs, exist_ok=True)
@@ -301,7 +327,7 @@ def main():
 
     vq_nn, vq_idx = audit["vqvae"][1], audit["vqvae"][2]
     rows, titles, m["interpolation_ssim_to_train"] = [], [], {}
-    for i in [0, 1, 2, int(vq_nn.argmax())]:
+    for i in dict.fromkeys([0, 1, 2, int(vq_nn.argmax())]):
         target = train[vq_idx[i]][None].float()
         z_sample = vqvae.quantizer.lookup(vq_codes[i:i + 1].to(DEVICE))
         z_train = vqvae.encode(target.to(DEVICE))

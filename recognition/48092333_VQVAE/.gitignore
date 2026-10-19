@@ -1,0 +1,7 @@
+outputs/
+*.pt
+*.pth
+*.nii
+*.nii.gz
+*.out
+__pycache__/

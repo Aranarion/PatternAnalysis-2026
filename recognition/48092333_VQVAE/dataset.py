@@ -59,7 +59,10 @@ def normalise(image):
 
 
 class HipMRISlices(Dataset):
-    """Slices held in memory as float16; optional random flip and gamma jitter."""
+    """Slices held in memory as float16; optional left-right flip and gamma jitter.
+
+    The patient's left-right axis runs along the image height, so flips use dim -2.
+    """
 
     def __init__(self, paths, augment=False):
         self.paths = paths
@@ -75,7 +78,7 @@ class HipMRISlices(Dataset):
         x = self.images[i].float()
         if self.augment:
             if torch.rand(1) < 0.5:
-                x = x.flip(-1)
+                x = x.flip(-2)
             x = x ** float(torch.empty(1).uniform_(0.9, 1.1))
         return x
 

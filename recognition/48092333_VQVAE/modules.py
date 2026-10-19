@@ -188,7 +188,7 @@ class GatedLayer(nn.Module):
     """Gated PixelCNN layer with vertical and horizontal stacks
     """
 
-    def __init__(self, dim, kernel_size, mask_type="B", residual=True):
+    def __init__(self, dim, kernel_size, mask_type="B", residual=True, dropout=0.0):
         super().__init__()
         k, p = kernel_size, kernel_size // 2
         v_mask = torch.ones(2 * dim, dim, p + 1, k)
@@ -200,6 +200,7 @@ class GatedLayer(nn.Module):
         self.horizontal = MaskedConv2d(dim, 2 * dim, (1, p + 1), padding=(0, p), mask=h_mask)
         self.v_to_h = nn.Conv2d(2 * dim, 2 * dim, 1)
         self.h_out = nn.Conv2d(dim, dim, 1)
+        self.dropout = nn.Dropout(dropout)
         self.residual = residual
 
     @staticmethod
@@ -211,19 +212,19 @@ class GatedLayer(nn.Module):
         height, width = x_v.shape[-2:]
         v = self.vertical(x_v)[:, :, :height]
         h = self.horizontal(x_h)[:, :, :, :width]
-        out_h = self.h_out(self.gate(h + self.v_to_h(v)))
+        out_h = self.h_out(self.dropout(self.gate(h + self.v_to_h(v))))
         return self.gate(v), out_h + x_h if self.residual else out_h
 
 
 class GatedPixelCNN(nn.Module):
     """Autoregressive prior over VQ-VAE code grids."""
 
-    def __init__(self, num_embeddings=512, dim=128, n_layers=15, kernel_size=5):
+    def __init__(self, num_embeddings=512, dim=128, n_layers=15, kernel_size=5, dropout=0.0):
         super().__init__()
         self.embedding = nn.Embedding(num_embeddings, dim)
         self.layers = nn.ModuleList(
-            [GatedLayer(dim, 7, "A", residual=False)]
-            + [GatedLayer(dim, kernel_size) for _ in range(n_layers - 1)]
+            [GatedLayer(dim, 7, "A", residual=False, dropout=dropout)]
+            + [GatedLayer(dim, kernel_size, dropout=dropout) for _ in range(n_layers - 1)]
         )
         self.output = nn.Sequential(nn.ReLU(), nn.Conv2d(dim, 512, 1), nn.ReLU(),
                                     nn.Conv2d(512, num_embeddings, 1))

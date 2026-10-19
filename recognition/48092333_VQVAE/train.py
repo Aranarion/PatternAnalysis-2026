@@ -75,3 +75,59 @@ def parse_args():
     p.add_argument("--prior-dim", type=int, default=128)
     p.add_argument("--prior-layers", type=int, default=15)
     return p.parse_args()
+
+def autoencoder_step(model, kind, x, kl_weight):
+    x = x.to(DEVICE, non_blocking=True)
+    if kind == "vqvae":
+        recon, commitment, perplexity, _ = model(x)
+        mse = F.mse_loss(recon, x)
+        loss = mse + commitment
+        logs = {"mse": mse.item(), "commitment": commitment.item(), "perplexity": perplexity.item()}
+    else:
+        recon, mu, logvar = model(x)
+        sse = F.mse_loss(recon, x, reduction="sum") / len(x)
+        kl = 0.5 * (mu.pow(2) + logvar.exp() - 1 - logvar).sum() / len(x)
+        loss = sse + kl_weight * kl
+        logs = {"sse": sse.item(), "kl": kl.item()}
+    with torch.no_grad():
+        logs.update(ssim=ssim(recon, x).mean().item(), psnr=psnr(recon, x).mean().item())
+    return loss, logs
+
+
+def prior_step(prior, codes):
+    codes = codes.to(DEVICE, non_blocking=True)
+    loss = F.cross_entropy(prior(codes), codes)
+    return loss, {"bits_per_code": loss.item() / math.log(2)}
+
+
+def run_epoch(model, loader, step, epoch=None, optimiser=None):
+    model.train(optimiser is not None)
+    totals, n = {}, 0
+    with torch.set_grad_enabled(optimiser is not None):
+        for batch in loader:
+            loss, logs = step(model, batch, epoch)
+            if optimiser:
+                optimiser.zero_grad(set_to_none=True)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimiser.step()
+            logs["loss"] = loss.item()
+            for k, v in logs.items():
+                totals[k] = totals.get(k, 0.0) + v * len(batch)
+            n += len(batch)
+    return {k: v / n for k, v in totals.items()}
+
+
+def plot_history(history, path):
+    metrics = [k[4:] for k in history[0] if k.startswith("val_")]
+    epochs = [h["epoch"] for h in history]
+    fig, axes = plt.subplots(1, len(metrics), figsize=(4 * len(metrics), 3.2), squeeze=False)
+    for ax, metric in zip(axes[0], metrics):
+        for split in ("train", "val"):
+            ax.plot(epochs, [h[f"{split}_{metric}"] for h in history], label=split)
+        ax.set(title=metric, xlabel="epoch")
+        ax.grid(alpha=0.3)
+        ax.legend()
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)

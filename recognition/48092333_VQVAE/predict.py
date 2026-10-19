@@ -299,6 +299,21 @@ def main():
                [[f"VAE t={t:.2f}" for t in steps], [f"VQ-VAE t={t:.2f}" for t in steps]],
                os.path.join(figs, "interpolation.png"), "Latent interpolation between two test patients")
 
+    vq_nn, vq_idx = audit["vqvae"][1], audit["vqvae"][2]
+    rows, titles, m["interpolation_ssim_to_train"] = [], [], {}
+    for i in [0, 1, 2, int(vq_nn.argmax())]:
+        target = train[vq_idx[i]][None].float()
+        z_sample = vqvae.quantizer.lookup(vq_codes[i:i + 1].to(DEVICE))
+        z_train = vqvae.encode(target.to(DEVICE))
+        frames = [vqvae.decode_latents((1 - t) * z_sample + t * z_train)[0].cpu() for t in steps]
+        scores = [ssim(f[None], target)[0].item() for f in frames]
+        rows.append(frames)
+        titles.append([f"sample {i} t={t:.2f}\nSSIM to train {s:.2f}" for t, s in zip(steps, scores)])
+        m["interpolation_ssim_to_train"][f"sample_{i}"] = {"nearest_train_slice": train_names[vq_idx[i]],
+                                                           "ssim_to_train": scores}
+    image_grid(rows, titles, os.path.join(figs, "interpolation_sample_to_train.png"),
+               "VQ-VAE: generated sample (t=0) to its nearest training scan (t=1)")
+
     cases = {"worst_reconstructions": [{"slice": test_names[i], "ssim_vqvae": s_vq[i].item(),
                                         "ssim_vae": s_vae[i].item()} for i in s_vq.argsort()[:20].tolist()],
              "least_plausible_vqvae": [{"sample": i, "nn_ssim_train": audit["vqvae"][1][i].item(),

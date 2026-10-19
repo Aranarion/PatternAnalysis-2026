@@ -1,4 +1,14 @@
+"""VQ-VAE, Gaussian VAE baseline and Gated PixelCNN prior.
+
+References: 
+VQ-VAE: van den Oord et al. 2017 
+Gated PixelCNN: van den Oord et al. 2016
+VAE: Kingma & Welling 2014
+Codebook restarts: Dhariwal et al. 2020
+"""
+
 import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -17,7 +27,7 @@ class ResidualBlock(nn.Module):
 
 
 class Encoder(nn.Sequential):
-    """Strided 4x4 convolutions then residual blocks; downsamples H and W by `downsample`."""
+    """Strided 4x4 convolutions then residual blocks, downsamples H and W."""
 
     def __init__(self, in_channels=1, hidden=128, res_hidden=64, n_res=2, downsample=4):
         stages = int(math.log2(downsample))
@@ -32,7 +42,7 @@ class Encoder(nn.Sequential):
 
 
 class Decoder(nn.Sequential):
-    """Residual blocks then transposed 4x4 convolutions; sigmoid output in [0, 1]."""
+    """Residual blocks then transposed 4x4 convolutions, sigmoid output in [0, 1]."""
 
     def __init__(self, in_channels, hidden=128, res_hidden=64, n_res=2, downsample=4, out_channels=1):
         stages = int(math.log2(downsample))
@@ -48,12 +58,9 @@ class Decoder(nn.Sequential):
             ch = out
         super().__init__(*layers)
 
+
 class VectorQuantizerEMA(nn.Module):
     """Nearest-neighbour codebook updated by exponential moving averages.
-
-    Codes are initialised from the first batch of encoder outputs, and every
-    `restart_every` steps any code that was not used in that window is moved to a
-    random current encoder output, which prevents codebook collapse.
     """
 
     def __init__(self, num_embeddings=512, embedding_dim=64, commitment_cost=0.25,
@@ -117,6 +124,7 @@ class VectorQuantizerEMA(nn.Module):
     def lookup(self, indices):
         return self.embedding[indices].permute(0, 3, 1, 2).contiguous()
 
+
 class VQVAE(nn.Module):
     def __init__(self, hidden=128, res_hidden=64, n_res=2, num_embeddings=512,
                  embedding_dim=64, downsample=4, commitment_cost=0.25, decay=0.99):
@@ -143,9 +151,8 @@ class VQVAE(nn.Module):
     def decode_latents(self, z_e):
         return self.decoder(self.quantizer(z_e)[0])
 
-class VAE(nn.Module):
-    """Baseline: same trunk as the VQ-VAE with a diagonal Gaussian latent."""
 
+class VAE(nn.Module):
     def __init__(self, hidden=128, res_hidden=64, n_res=2, latent_dim=64, downsample=4,
                  image_shape=(256, 128)):
         super().__init__()
@@ -167,7 +174,80 @@ class VAE(nn.Module):
     def sample(self, n, device):
         return self.decoder(torch.randn((n,) + self.latent_shape, device=device))
 
-MODELS = {"vae": VAE, "vqvae": VQVAE}
+
+class MaskedConv2d(nn.Conv2d):
+    def __init__(self, *args, mask, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.register_buffer("mask", mask)
+
+    def forward(self, x):
+        return F.conv2d(x, self.weight * self.mask, self.bias, self.stride, self.padding)
+
+
+class GatedLayer(nn.Module):
+    """Gated PixelCNN layer with vertical and horizontal stacks
+    """
+
+    def __init__(self, dim, kernel_size, mask_type="B", residual=True):
+        super().__init__()
+        k, p = kernel_size, kernel_size // 2
+        v_mask = torch.ones(2 * dim, dim, p + 1, k)
+        h_mask = torch.ones(2 * dim, dim, 1, p + 1)
+        if mask_type == "A":
+            v_mask[:, :, -1] = 0
+            h_mask[:, :, :, -1] = 0
+        self.vertical = MaskedConv2d(dim, 2 * dim, (p + 1, k), padding=(p, p), mask=v_mask)
+        self.horizontal = MaskedConv2d(dim, 2 * dim, (1, p + 1), padding=(0, p), mask=h_mask)
+        self.v_to_h = nn.Conv2d(2 * dim, 2 * dim, 1)
+        self.h_out = nn.Conv2d(dim, dim, 1)
+        self.residual = residual
+
+    @staticmethod
+    def gate(x):
+        a, b = x.chunk(2, dim=1)
+        return torch.tanh(a) * torch.sigmoid(b)
+
+    def forward(self, x_v, x_h):
+        height, width = x_v.shape[-2:]
+        v = self.vertical(x_v)[:, :, :height]
+        h = self.horizontal(x_h)[:, :, :, :width]
+        out_h = self.h_out(self.gate(h + self.v_to_h(v)))
+        return self.gate(v), out_h + x_h if self.residual else out_h
+
+
+class GatedPixelCNN(nn.Module):
+    """Autoregressive prior over VQ-VAE code grids."""
+
+    def __init__(self, num_embeddings=512, dim=128, n_layers=15, kernel_size=5):
+        super().__init__()
+        self.embedding = nn.Embedding(num_embeddings, dim)
+        self.layers = nn.ModuleList(
+            [GatedLayer(dim, 7, "A", residual=False)]
+            + [GatedLayer(dim, kernel_size) for _ in range(n_layers - 1)]
+        )
+        self.output = nn.Sequential(nn.ReLU(), nn.Conv2d(dim, 512, 1), nn.ReLU(),
+                                    nn.Conv2d(512, num_embeddings, 1))
+
+    def forward(self, codes):
+        x = self.embedding(codes).permute(0, 3, 1, 2)
+        x_v, x_h = x, x
+        for layer in self.layers:
+            x_v, x_h = layer(x_v, x_h)
+        return self.output(x_h)
+
+    @torch.no_grad()
+    def sample(self, n, grid_shape, device, temperature=1.0, generator=None):
+        h, w = grid_shape
+        codes = torch.zeros(n, h, w, dtype=torch.long, device=device)
+        for i in range(h):
+            for j in range(w):
+                logits = self(codes[:, : i + 1])[:, :, i, j] / temperature
+                codes[:, i, j] = torch.multinomial(logits.softmax(1), 1, generator=generator)[:, 0]
+        return codes
+
+
+MODELS = {"vae": VAE, "vqvae": VQVAE, "prior": GatedPixelCNN}
+
 
 def load_model(path, device="cpu"):
     """Rebuild a model from a checkpoint written by train.py."""

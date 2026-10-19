@@ -1,3 +1,12 @@
+"""Train the VAE baseline, the VQ-VAE, or the PixelCNN prior over VQ-VAE codes.
+
+    python train.py --model vae
+    python train.py --model vqvae
+    python train.py --model prior --vqvae-ckpt outputs/vqvae/best.pt
+
+Writes best.pt (lowest validation loss), history.json and curves.png to <out-dir>/<model>/.
+"""
+
 import argparse
 import json
 import math
@@ -19,6 +28,7 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 def ssim(x, y, data_range=1.0):
+    """Per-image SSIM (Wang et al. 2004)"""
     x, y = x.float(), y.float()
     g = torch.exp(-(torch.arange(11, device=x.device) - 5.0) ** 2 / 4.5)
     window = (g[:, None] * g[None, :] / g.sum() ** 2)[None, None]
@@ -76,6 +86,7 @@ def parse_args():
     p.add_argument("--prior-layers", type=int, default=15)
     return p.parse_args()
 
+
 def autoencoder_step(model, kind, x, kl_weight):
     x = x.to(DEVICE, non_blocking=True)
     if kind == "vqvae":
@@ -131,3 +142,81 @@ def plot_history(history, path):
     fig.tight_layout()
     fig.savefig(path, dpi=150)
     plt.close(fig)
+
+
+def fit(model, config, loaders, step, args, extra):
+    out_dir = os.path.join(args.out_dir, args.model)
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, "best.pt")
+    optimiser = torch.optim.Adam(model.parameters(), lr=args.lr)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimiser, args.epochs)
+    history, best, start = [], float("inf"), time.time()
+
+    for epoch in range(1, args.epochs + 1):
+        stats, t0 = {}, time.time()
+        with peak_vram(stats):
+            train = run_epoch(model, loaders["train"], step, epoch, optimiser)
+        scheduler.step()
+        val = run_epoch(model, loaders["validate"], step)
+        record = {"epoch": epoch, **{f"train_{k}": v for k, v in train.items()},
+                  **{f"val_{k}": v for k, v in val.items()}, "epoch_s": time.time() - t0, **stats}
+        history.append(record)
+        print(" ".join(f"{k}={v:.4g}" for k, v in record.items() if v is not None), flush=True)
+        if val["loss"] < best:
+            best = val["loss"]
+            torch.save({"kind": args.model, "config": config, "state_dict": model.state_dict(),
+                        "epoch": epoch, "args": vars(args), **extra}, path)
+
+    model, ckpt = load_model(path, DEVICE)
+    ckpt["test"] = run_epoch(model, loaders["test"], step)
+    ckpt["stats"] = {"parameters": count_parameters(model), "best_epoch": ckpt["epoch"],
+                     "train_time_s": time.time() - start,
+                     "peak_train_vram_mb": max(h["peak_vram_mb"] or 0 for h in history)}
+    torch.save(ckpt, path)
+    with open(os.path.join(out_dir, "history.json"), "w") as f:
+        json.dump(history, f, indent=2)
+    plot_history(history, os.path.join(out_dir, "curves.png"))
+    print("test:", ckpt["test"])
+    print("stats:", ckpt["stats"])
+
+
+def main():
+    args = parse_args()
+    torch.manual_seed(args.seed)
+    torch.backends.cudnn.benchmark = True
+
+    if args.model == "prior":
+        vqvae, vq_ckpt = load_model(args.vqvae_ckpt, DEVICE)
+        vq_args = vq_ckpt["args"]
+        datasets = get_datasets(vq_args["data_root"], vq_args["max_slices"], seed=vq_args["seed"])
+        codes = {s: torch.cat([vqvae.encode_indices(x.to(DEVICE)).cpu() for x in DataLoader(d, 64)])
+                 for s, d in datasets.items()}
+        loaders = {s: DataLoader(c, args.batch_size, shuffle=s == "train", drop_last=s == "train")
+                   for s, c in codes.items()}
+        config = dict(num_embeddings=vqvae.quantizer.num_embeddings, dim=args.prior_dim,
+                      n_layers=args.prior_layers)
+        extra = {"grid_shape": tuple(codes["train"].shape[1:]), "vqvae_ckpt": os.path.abspath(args.vqvae_ckpt)}
+
+        def step(model, batch, epoch):
+            return prior_step(model, batch)
+    else:
+        loaders, _ = get_dataloaders(args.batch_size, args.num_workers, data_root=args.data_root,
+                                     max_slices=args.max_slices, augment=args.augment, seed=args.seed)
+        if args.model == "vqvae":
+            config = dict(num_embeddings=args.num_embeddings, embedding_dim=args.embedding_dim,
+                          downsample=args.downsample)
+        else:
+            config = dict(latent_dim=args.embedding_dim, downsample=args.downsample, image_shape=IMAGE_SHAPE)
+        extra = {}
+
+        def step(model, batch, epoch):
+            warmup = 1.0 if epoch is None else min(1.0, epoch / args.kl_warmup)
+            return autoencoder_step(model, args.model, batch, args.kl_weight * warmup)
+
+    model = MODELS[args.model](**config).to(DEVICE)
+    print(f"{args.model}: {count_parameters(model):,} parameters on {DEVICE}")
+    fit(model, config, loaders, step, args, extra)
+
+
+if __name__ == "__main__":
+    main()

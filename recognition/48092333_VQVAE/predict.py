@@ -197,6 +197,40 @@ def audit_prior(args):
 
 
 @torch.no_grad()
+def evaluate_vae(args):
+    """Benchmark one VAE checkpoint (e.g. a different KL weight) on the test patients."""
+    vae, ckpt = load_model(args.vae_ckpt, DEVICE)
+    a, name = ckpt["args"], f"vae_kl{ckpt['args']['kl_weight']:g}"
+    data = get_datasets(a["data_root"], a["max_slices"], splits=("train", "test"), seed=a["seed"])
+    train, test = data["train"].images, data["test"].images
+    rec = batched(lambda x: vae(x.float())[0], test)
+    scores = ssim(rec, test)
+    sizes = [min(args.batch_size, args.num_samples - i) for i in range(0, args.num_samples, args.batch_size)]
+    samples = torch.cat([vae.sample(k, DEVICE).cpu() for k in sizes])
+    threshold = torch.quantile(nearest_ssim(test, train)[0], 0.99).item()
+    result = {"vae_ckpt": args.vae_ckpt, "kl_weight": a["kl_weight"], "epoch": ckpt["epoch"],
+              "reconstruction": {"ssim": summarise(scores), "psnr": summarise(psnr(rec, test)),
+                                 "frac_ssim_above_0.6": (scores > 0.6).float().mean().item()},
+              "generation": generation_stats(nearest_ssim(samples, train)[0], samples, threshold)}
+    if not args.no_fid:
+        inception = InceptionFeatures().to(DEVICE)
+        reference = inception(train[torch.randperm(len(train))[:2000]])
+        features = inception(samples)
+        result["generation"].update(fid=frechet_distance(features, reference),
+                                    **density_coverage(reference, features))
+    out = os.path.join(args.out_dir, "predict")
+    os.makedirs(os.path.join(out, "figures"), exist_ok=True)
+    idx = torch.linspace(0, len(test) - 1, 8).long()
+    image_grid([[test[i] for i in idx], [rec[i] for i in idx], list(samples[:8]), list(samples[8:16])],
+               [[f"test {i}" for i in idx], [f"recon SSIM {scores[i]:.3f}" for i in idx]] + [[""] * 8] * 2,
+               os.path.join(out, "figures", f"{name}.png"),
+               f"VAE (KL weight {a['kl_weight']:g}): test slices, reconstructions, 16 uncurated samples")
+    with open(os.path.join(out, f"{name}.json"), "w") as f:
+        json.dump(result, f, indent=2)
+    print(json.dumps(result, indent=2))
+
+
+@torch.no_grad()
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--out-dir", default="outputs")
@@ -206,10 +240,13 @@ def main():
     p.add_argument("--no-fid", action="store_true")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--prior-ckpt", help="only run the memorisation audit for this prior checkpoint")
+    p.add_argument("--vae-ckpt", help="only benchmark this VAE checkpoint")
     args = p.parse_args()
     torch.manual_seed(args.seed)
     if args.prior_ckpt:
         return audit_prior(args)
+    if args.vae_ckpt:
+        return evaluate_vae(args)
     out = os.path.join(args.out_dir, "predict")
     figs = os.path.join(out, "figures")
     os.makedirs(figs, exist_ok=True)

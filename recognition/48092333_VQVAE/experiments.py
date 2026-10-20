@@ -12,6 +12,9 @@ vae-sweep: trains VAE baselines at KL weights 1, 0.1 and 0.01 and benchmarks eac
 
 Each writes a markdown table plus every run's checkpoint, history and figures to
 <out-dir>/<experiment>/.
+
+Results in the README were first produced with experiment-specific flags (commits
+6def138-44bdeb4); this file reproduces those runs bit-for-bit on top of the final code.
 """
 
 import argparse
@@ -40,6 +43,7 @@ KL_WEIGHTS = (1.0, 0.1, 0.01)
 
 
 def write_table(out, name, lines):
+    """Save markdown table lines to out/name and print them."""
     os.makedirs(out, exist_ok=True)
     with open(os.path.join(out, name), "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
@@ -47,6 +51,12 @@ def write_table(out, name, lines):
 
 
 def regularisation(out, vqvae_ckpt, train_args, variants=None, **audit_args):
+    """Train the PRIOR_VARIANTS priors and tabulate them.
+
+    Each variant adds one regulariser to the one before, and the last is the final prior
+    used by train.py. AUDITED_VARIANTS are also saved at AUDIT_EPOCHS and audited for
+    memorisation. train_args are extra train.py options; audit_args are passed to audit_prior.
+    """
     lines = ["| Prior | Best epoch | Min validation bits/code | Test bits/code | Final val - train gap "
              "| Parameters | s/epoch |", "|---|---|---|---|---|---|---|"]
     memorisation = ["| Prior | Epoch | Validation bits/code | Possible copies | Near-duplicates | Mean NN-SSIM "
@@ -117,6 +127,7 @@ def evaluate_vae(path, out, num_samples=1000, batch_size=100, seed=0, fid=True):
 
 
 def vae_sweep(out, train_args, fid=True, **evaluate_args):
+    """Train a VAE at each of KL_WEIGHTS with train.py, benchmark each with evaluate_vae, and tabulate them."""
     lines = ["| KL weight | Reconstruction SSIM | Slices with SSIM > 0.6 | Sample NN-SSIM | Pairwise SSIM "
              "| FID | Density | Coverage |", "|---|---|---|---|---|---|---|---|"]
     for w in KL_WEIGHTS:
@@ -131,9 +142,9 @@ def vae_sweep(out, train_args, fid=True, **evaluate_args):
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("experiment", choices=["regularisation", "vae-sweep"])
+    p.add_argument("experiment", choices=["regularisation", "vae-sweep"], help="which side experiment to run")
     p.add_argument("--out-dir", default="outputs_experiments")
-    p.add_argument("--vqvae-ckpt", default="outputs/vqvae/best.pt")
+    p.add_argument("--vqvae-ckpt", default="outputs/vqvae/best.pt", help="trained VQ-VAE whose code grids the priors model")
     p.add_argument("--variants", nargs="*", choices=list(PRIOR_VARIANTS), help="only these priors (default: all)")
     args = p.parse_args()
     torch.backends.cudnn.benchmark = True

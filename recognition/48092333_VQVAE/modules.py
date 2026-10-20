@@ -1,10 +1,11 @@
-"""VQ-VAE, Gaussian VAE baseline and Gated PixelCNN prior.
+"""VQ-VAE, Gaussian VAE baselines and Gated PixelCNN prior (pure PyTorch).
 
-References: 
-VQ-VAE: van den Oord et al. 2017 
-Gated PixelCNN: van den Oord et al. 2016
-VAE: Kingma & Welling 2014
-Codebook restarts: Dhariwal et al. 2020
+References:
+    VQ-VAE and EMA codebook: van den Oord et al. 2017
+    Gated PixelCNN: van den Oord et al. 2016
+    VAE: Kingma & Welling 2014
+    Codebook restarts: Dhariwal et al. 2020 (Jukebox)
+    Dropout in PixelCNNs: Salimans et al. 2017 (PixelCNN++)
 """
 
 import math
@@ -15,6 +16,8 @@ import torch.nn.functional as F
 
 
 class ResidualBlock(nn.Module):
+    """x + Conv1x1(ReLU(Conv3x3(ReLU(x)))), the residual block of the VQ-VAE paper."""
+
     def __init__(self, channels, res_channels):
         super().__init__()
         self.block = nn.Sequential(
@@ -61,6 +64,10 @@ class Decoder(nn.Sequential):
 
 class VectorQuantizerEMA(nn.Module):
     """Nearest-neighbour codebook updated by exponential moving averages.
+
+    The codebook is initialised from the first batch of encoder outputs, and every
+    `restart_every` steps any code unused in that window is moved to a random current
+    encoder output, preventing codebook collapse.
     """
 
     def __init__(self, num_embeddings=512, embedding_dim=64, commitment_cost=0.25,
@@ -78,6 +85,10 @@ class VectorQuantizerEMA(nn.Module):
         self.register_buffer("steps", torch.zeros((), dtype=torch.long))
 
     def forward(self, z):
+        """z (B, D, H, W) -> (z_q, commitment loss, perplexity, code indices (B, H, W)).
+
+        Gradients reach z through the straight-through estimator.
+        """
         b, d, h, w = z.shape
         flat = z.permute(0, 2, 3, 1).reshape(-1, d)
         if self.training and self.steps == 0:
@@ -98,6 +109,7 @@ class VectorQuantizerEMA(nn.Module):
 
     @torch.no_grad()
     def _update(self, flat, indices):
+        """EMA update of code counts and sums (Laplace-smoothed), then periodic restart of unused codes."""
         counts = torch.bincount(indices, minlength=self.num_embeddings).float()
         sums = torch.zeros_like(self.ema_sum).index_add_(0, indices, flat)
         self.ema_size.mul_(self.decay).add_(counts, alpha=1 - self.decay)
@@ -114,6 +126,7 @@ class VectorQuantizerEMA(nn.Module):
 
     @torch.no_grad()
     def _restart(self, dead, flat):
+        """Move the codes flagged in `dead` to randomly chosen current encoder outputs."""
         n = int(dead.sum())
         if n:
             new = flat[torch.randint(0, flat.shape[0], (n,), device=flat.device)]
@@ -122,10 +135,13 @@ class VectorQuantizerEMA(nn.Module):
             self.ema_size[dead] = 1.0
 
     def lookup(self, indices):
+        """Code indices (B, H, W) -> codebook vectors (B, D, H, W)."""
         return self.embedding[indices].permute(0, 3, 1, 2).contiguous()
 
 
 class VQVAE(nn.Module):
+    """Encoder -> 1x1 projection -> vector quantiser -> decoder."""
+
     def __init__(self, hidden=128, res_hidden=64, n_res=2, num_embeddings=512,
                  embedding_dim=64, downsample=4, commitment_cost=0.25, decay=0.99):
         super().__init__()
@@ -135,24 +151,31 @@ class VQVAE(nn.Module):
         self.decoder = Decoder(embedding_dim, hidden, res_hidden, n_res, downsample)
 
     def encode(self, x):
+        """Continuous encoder outputs z_e, before quantisation."""
         return self.pre_quant(self.encoder(x))
 
     def forward(self, x):
+        """Returns (reconstruction, commitment loss, perplexity, code indices)."""
         z_q, commitment, perplexity, indices = self.quantizer(self.encode(x))
         return self.decoder(z_q), commitment, perplexity, indices
 
     @torch.no_grad()
     def encode_indices(self, x):
+        """Code grid (B, H, W) for a batch of slices."""
         return self.quantizer(self.encode(x))[3]
 
     def decode_indices(self, indices):
+        """Slices from a code grid, e.g. one sampled by the PixelCNN."""
         return self.decoder(self.quantizer.lookup(indices))
 
     def decode_latents(self, z_e):
+        """Quantise and decode arbitrary continuous latents (used for interpolation)."""
         return self.decoder(self.quantizer(z_e)[0])
 
 
 class VAE(nn.Module):
+    """Baseline: the same encoder/decoder with a diagonal Gaussian latent instead of a codebook."""
+
     def __init__(self, hidden=128, res_hidden=64, n_res=2, latent_dim=64, downsample=4,
                  image_shape=(256, 128)):
         super().__init__()
@@ -162,20 +185,25 @@ class VAE(nn.Module):
         self.decoder = Decoder(latent_dim, hidden, res_hidden, n_res, downsample)
 
     def encode(self, x):
+        """Mean and log-variance of q(z|x); log-variance clamped for numerical stability."""
         mu, logvar = self.to_moments(self.encoder(x)).chunk(2, dim=1)
         return mu, logvar.clamp(-30, 20)
 
     def forward(self, x):
+        """Reparameterised sample while training, the mean at evaluation; returns (reconstruction, mu, logvar)."""
         mu, logvar = self.encode(x)
         z = mu + torch.randn_like(mu) * torch.exp(0.5 * logvar) if self.training else mu
         return self.decoder(z), mu, logvar
 
     @torch.no_grad()
     def sample(self, n, device):
+        """Decode n draws from N(0, I)."""
         return self.decoder(torch.randn((n,) + self.latent_shape, device=device))
 
 
 class MaskedConv2d(nn.Conv2d):
+    """Conv2d whose kernel is multiplied by a fixed binary mask, so masked weights never contribute."""
+
     def __init__(self, *args, mask, **kwargs):
         super().__init__(*args, **kwargs)
         self.register_buffer("mask", mask)
@@ -185,7 +213,11 @@ class MaskedConv2d(nn.Conv2d):
 
 
 class GatedLayer(nn.Module):
-    """Gated PixelCNN layer with vertical and horizontal stacks
+    """Gated PixelCNN layer with vertical (rows above) and horizontal (left in the row) stacks.
+
+    The two stacks avoid the original PixelCNN's blind spot. Mask "A" (first layer only)
+    also hides the current position, so no layer sees the code it predicts. Outputs are
+    cropped to keep both stacks causal.
     """
 
     def __init__(self, dim, kernel_size, mask_type="B", residual=True, dropout=0.0):
@@ -205,10 +237,12 @@ class GatedLayer(nn.Module):
 
     @staticmethod
     def gate(x):
+        """Gated activation tanh(a) * sigmoid(b)."""
         a, b = x.chunk(2, dim=1)
         return torch.tanh(a) * torch.sigmoid(b)
 
     def forward(self, x_v, x_h):
+        """Returns the updated (vertical, horizontal) stack features."""
         height, width = x_v.shape[-2:]
         v = self.vertical(x_v)[:, :, :height]
         h = self.horizontal(x_h)[:, :, :, :width]
@@ -217,7 +251,11 @@ class GatedLayer(nn.Module):
 
 
 class GatedPixelCNN(nn.Module):
-    """Autoregressive prior over VQ-VAE code grids."""
+    """Autoregressive prior over VQ-VAE code grids.
+
+    The defaults (width 64, dropout 0.2) are the regularised configuration selected on
+    validation loss.
+    """
 
     def __init__(self, num_embeddings=512, dim=64, n_layers=15, kernel_size=5, dropout=0.2):
         super().__init__()
@@ -230,6 +268,7 @@ class GatedPixelCNN(nn.Module):
                                     nn.Conv2d(512, num_embeddings, 1))
 
     def forward(self, codes):
+        """Code grid (B, H, W) -> logits over the codebook at every position (B, K, H, W)."""
         x = self.embedding(codes).permute(0, 3, 1, 2)
         x_v, x_h = x, x
         for layer in self.layers:
@@ -238,6 +277,10 @@ class GatedPixelCNN(nn.Module):
 
     @torch.no_grad()
     def sample(self, n, grid_shape, device, temperature=1.0, generator=None):
+        """Generate n code grids one code at a time in raster order.
+
+        Only rows up to the current one are fed in, since later rows cannot affect it.
+        """
         h, w = grid_shape
         codes = torch.zeros(n, h, w, dtype=torch.long, device=device)
         for i in range(h):

@@ -1,12 +1,13 @@
-"""Train the VAE baseline, the VQ-VAE, or the PixelCNN prior over VQ-VAE codes.
+"""Train the VAE baselines, the VQ-VAE, or the PixelCNN prior over VQ-VAE codes.
 
     python train.py --model vae --kl-weight 0.1
     python train.py --model vae --kl-weight 0.01
     python train.py --model vqvae
     python train.py --model prior --vqvae-ckpt outputs/vqvae/best.pt
 
-Writes best.pt (lowest validation loss), history.json and curves.png to <out-dir>/<model>/,
-where VAEs are saved as vae_kl<weight>.
+Writes best.pt (lowest validation loss, with test metrics and run statistics), history.json
+and curves.png to <out-dir>/<model>/, where VAEs are saved as vae_kl<weight>. Also provides
+the SSIM/PSNR metrics and profiling helpers used by predict.py.
 """
 
 import argparse
@@ -30,7 +31,10 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 def ssim(x, y, data_range=1.0):
-    """Per-image SSIM (Wang et al. 2004)"""
+    """Per-image SSIM (Wang et al. 2004) with an 11x11 Gaussian window (sigma 1.5).
+
+    Matches scikit-image to within about 1e-7.
+    """
     x, y = x.float(), y.float()
     g = torch.exp(-(torch.arange(11, device=x.device) - 5.0) ** 2 / 4.5)
     window = (g[:, None] * g[None, :] / g.sum() ** 2)[None, None]
@@ -44,6 +48,7 @@ def ssim(x, y, data_range=1.0):
 
 
 def psnr(x, y):
+    """Per-image PSNR in dB for images in [0, 1]."""
     mse = (x.float() - y.float()).pow(2).flatten(1).mean(1)
     return 10 * torch.log10(1 / mse.clamp_min(1e-10))
 
@@ -53,12 +58,14 @@ def count_parameters(model):
 
 
 def sync():
+    """Wait for queued GPU work to finish, so timings and memory readings are accurate."""
     if DEVICE.type == "cuda":
         torch.cuda.synchronize()
 
 
 @contextmanager
 def peak_vram(stats, key="peak_vram_mb"):
+    """Context manager recording the peak GPU memory (MB) allocated inside the block into stats[key]."""
     if DEVICE.type == "cuda":
         torch.cuda.reset_peak_memory_stats()
     yield
@@ -72,18 +79,18 @@ def parse_args(argv=None):
     p.add_argument("--data-root", default=DATA_ROOT)
     p.add_argument("--out-dir", default="outputs")
     p.add_argument("--max-slices", type=int, help="random subset per split (smoke tests)")
-    p.add_argument("--augment", action="store_true")
+    p.add_argument("--augment", action="store_true", help="left-right flip and gamma jitter (autoencoders only)")
     p.add_argument("--epochs", type=int, default=50)
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--lr", type=float, default=2e-4)
     p.add_argument("--num-workers", type=int, default=4)
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--downsample", type=int, default=4)
+    p.add_argument("--downsample", type=int, default=4, help="encoder downsampling factor (power of 2)")
     p.add_argument("--num-embeddings", type=int, default=512)
     p.add_argument("--embedding-dim", type=int, default=64, help="also the VAE latent channels")
     p.add_argument("--kl-weight", type=float, default=0.1, help="the benchmark uses 0.1 and 0.01")
     p.add_argument("--kl-warmup", type=int, default=5, help="epochs of linear KL warm-up")
-    p.add_argument("--vqvae-ckpt")
+    p.add_argument("--vqvae-ckpt", help="VQ-VAE whose code grids the prior models")
     p.add_argument("--prior-dim", type=int, default=64)
     p.add_argument("--prior-layers", type=int, default=15)
     p.add_argument("--save-epochs", type=int, nargs="*", default=[], help="also save checkpoints at these epochs")
@@ -91,6 +98,10 @@ def parse_args(argv=None):
 
 
 def autoencoder_step(model, kind, x, kl_weight):
+    """Loss and logs for one batch.
+
+    VQ-VAE: MSE + commitment. VAE: negative ELBO per image, summed squared error + kl_weight * KL.
+    """
     x = x.to(DEVICE, non_blocking=True)
     if kind == "vqvae":
         recon, commitment, perplexity, _ = model(x)
@@ -109,12 +120,17 @@ def autoencoder_step(model, kind, x, kl_weight):
 
 
 def prior_step(prior, codes):
+    """PixelCNN cross-entropy on a batch of code grids, logged as bits per code."""
     codes = codes.to(DEVICE, non_blocking=True)
     loss = F.cross_entropy(prior(codes), codes)
     return loss, {"bits_per_code": loss.item() / math.log(2)}
 
 
 def run_epoch(model, loader, step, epoch=None, optimiser=None):
+    """One pass over `loader`, training when an optimiser is given (gradients clipped at 1.0).
+
+    Returns per-sample mean logs.
+    """
     model.train(optimiser is not None)
     totals, n = {}, 0
     with torch.set_grad_enabled(optimiser is not None):
@@ -133,6 +149,7 @@ def run_epoch(model, loader, step, epoch=None, optimiser=None):
 
 
 def plot_history(history, path):
+    """Plot every logged metric against epoch for training and validation."""
     metrics = [k[4:] for k in history[0] if k.startswith("val_")]
     epochs = [h["epoch"] for h in history]
     fig, axes = plt.subplots(1, len(metrics), figsize=(4 * len(metrics), 3.2), squeeze=False)
@@ -163,6 +180,12 @@ def prior_loaders(vqvae_ckpt, batch_size, mirror=True):
 
 
 def fit(model, config, loaders, step, args, extra, weight_decay=0.0):
+    """Train with AdamW and cosine decay, keeping the checkpoint with the lowest validation loss.
+
+    Checkpoints at any `save_epochs` are also kept. The best checkpoint is then evaluated once
+    on the test split, and its test metrics and run statistics (parameters, training time,
+    peak VRAM) are stored in it.
+    """
     name = f"vae_kl{args.kl_weight:g}" if args.model == "vae" else args.model
     out_dir = os.path.join(args.out_dir, name)
     os.makedirs(out_dir, exist_ok=True)
@@ -203,6 +226,12 @@ def fit(model, config, loaders, step, args, extra, weight_decay=0.0):
 
 
 def main(argv=None):
+    """Build the data, model and loss for --model, then train.
+
+    The prior uses weight decay 0.01 (the regularised configuration) and the autoencoders none.
+    The VAE's KL weight warms up linearly over --kl-warmup epochs, but validation always uses
+    the full weight.
+    """
     args = parse_args(argv)
     torch.manual_seed(args.seed)
     torch.backends.cudnn.benchmark = True

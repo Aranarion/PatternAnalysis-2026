@@ -1,8 +1,12 @@
-"""Run the trained models on unseen test patients, generate new slices, and benchmark the VQ-VAE + PixelCNN against the VAE baseline.
+"""Benchmark the trained models on unseen test patients and audit generated slices.
 
     python predict.py --out-dir outputs
 
-Writes metrics.json, results.md, cases.json and figures/ to <out-dir>/predict/.
+Reconstructs the test patients with both VAEs and the VQ-VAE, generates slices with every
+model, and compares them on fidelity, diversity, distribution match and memorisation. A
+generated slice counts as a possible copy of a training patient when its SSIM to the
+nearest training slice exceeds the 99th percentile reached by real slices of the unseen test
+patients. Writes metrics.json, results.md, cases.json and figures/ to <out-dir>/predict/.
 """
 
 import argparse
@@ -27,16 +31,19 @@ NAMES = {"vae_kl0.1": "VAE (KL 0.1)", "vae_kl0.01": "VAE (KL 0.01)", "vqvae": "V
 
 
 def summarise(values):
+    """Mean, std, min and max of a 1D tensor as plain floats."""
     return {"mean": values.mean().item(), "std": values.std().item(),
             "min": values.min().item(), "max": values.max().item()}
 
 
 @torch.no_grad()
 def batched(fn, inputs, batch_size=64):
+    """Apply fn to inputs in GPU batches and concatenate the results on the CPU."""
     return torch.cat([fn(inputs[i:i + batch_size].to(DEVICE)).cpu() for i in range(0, len(inputs), batch_size)])
 
 
 def timed(fn):
+    """Run fn once; return (result, wall-clock seconds), synchronising the GPU so the timing is accurate."""
     sync()
     start = time.perf_counter()
     result = fn()
@@ -46,6 +53,7 @@ def timed(fn):
 
 @torch.no_grad()
 def time_ms(fn, repeats=20):
+    """Mean time of fn() in milliseconds over `repeats` runs, after 3 warm-up runs."""
     for _ in range(3):
         fn()
     return 1000 * timed(lambda: [fn() for _ in range(repeats)])[1] / repeats
@@ -55,7 +63,8 @@ def time_ms(fn, repeats=20):
 def nearest_ssim(queries, references, k=5, chunk=256):
     """Highest SSIM between each query and its k nearest references by pixel L2.
 
-    Returns (best SSIM, index of that reference) per query.
+    Pixel L2 cheaply picks k candidates; SSIM is computed only on those. Returns
+    (best SSIM, index of that reference) per query.
     """
     refs = references.flatten(1).float().to(DEVICE)
     best, best_idx = [], []
@@ -78,7 +87,10 @@ def pairwise_ssim(images, n_pairs=1000, seed=0):
 
 
 class InceptionFeatures(nn.Module):
-    """2048-d torchvision Inception-v3 features (FID comparable within this project only)."""
+    """2048-d torchvision Inception-v3 features (FID comparable within this project only).
+
+    ImageNet weights; greyscale slices are repeated to 3 channels and resized to 299x299.
+    """
 
     def __init__(self):
         super().__init__()
@@ -100,6 +112,10 @@ class InceptionFeatures(nn.Module):
 
 
 def frechet_distance(f1, f2):
+    """Frechet Inception Distance between two feature sets (Heusel et al. 2017).
+
+    Tr((S1 S2)^(1/2)) is the sum of square roots of the eigenvalues of S1 S2.
+    """
     mu1, mu2 = f1.mean(0), f2.mean(0)
     s1, s2 = torch.cov(f1.t()), torch.cov(f2.t())
     sqrt_trace = torch.linalg.eigvals(s1 @ s2).real.clamp_min(0).sqrt().sum()
@@ -116,6 +132,10 @@ def density_coverage(real, fake, k=5):
 
 
 def generation_stats(nn_train, images, threshold):
+    """Fidelity, memorisation and diversity statistics of a set of images.
+
+    nn_train holds each image's SSIM to its nearest training slice.
+    """
     return {"nn_ssim_train": summarise(nn_train),
             "frac_above_0.6": (nn_train > 0.6).float().mean().item(),
             "frac_possible_copy": (nn_train > threshold).float().mean().item(),
@@ -124,6 +144,7 @@ def generation_stats(nn_train, images, threshold):
 
 
 def image_grid(rows, titles, path, title):
+    """Save a grid of images: one list of images and one of titles per row."""
     fig, axes = plt.subplots(len(rows), len(rows[0]), figsize=(1.5 * len(rows[0]), 2.9 * len(rows)),
                              squeeze=False)
     for r, row in enumerate(rows):
@@ -138,6 +159,7 @@ def image_grid(rows, titles, path, title):
 
 
 def write_markdown(m, path):
+    """Write the reconstruction, generation and resource tables of metrics `m` as markdown."""
     def ms(s, d=3):
         return f"{s['mean']:.{d}f} ± {s['std']:.{d}f}"
 
@@ -181,7 +203,10 @@ def write_markdown(m, path):
 
 @torch.no_grad()
 def audit_prior(vqvae_path, prior_path, num_samples=300, batch_size=100, temperature=1.0, seed=0):
-    """Memorisation audit of samples from one prior checkpoint (e.g. an over-trained epoch)."""
+    """Memorisation audit of samples from one prior checkpoint (e.g. an over-trained epoch).
+
+    Uses the same 99th-percentile threshold as main().
+    """
     torch.manual_seed(seed)
     vqvae, ckpt = load_model(vqvae_path, DEVICE)
     prior, prior_ckpt = load_model(prior_path, DEVICE)
@@ -201,12 +226,23 @@ def audit_prior(vqvae_path, prior_path, num_samples=300, batch_size=100, tempera
 
 @torch.no_grad()
 def main():
+    """Full benchmark of both VAEs and the VQ-VAE + PixelCNN on the test patients.
+
+    1. Reconstruct the test slices and time each model.
+    2. Generate num_samples slices per model.
+    3. Memorisation audit: SSIM of each sample to its nearest training and test slice.
+    4. FID, density and coverage on Inception features (unless --no-fid).
+    5. Codebook usage of generated vs training code grids.
+    6. Figures: reconstructions, sample grids, closest and least plausible samples,
+       histogram, and both interpolations.
+    7. Save metrics.json, cases.json and results.md.
+    """
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--out-dir", default="outputs")
-    p.add_argument("--num-samples", type=int, default=1000)
+    p.add_argument("--num-samples", type=int, default=1000, help="generated slices per model")
     p.add_argument("--batch-size", type=int, default=100)
-    p.add_argument("--temperature", type=float, default=1.0)
-    p.add_argument("--no-fid", action="store_true")
+    p.add_argument("--temperature", type=float, default=1.0, help="PixelCNN sampling temperature")
+    p.add_argument("--no-fid", action="store_true", help="skip FID, density and coverage (needs no Inception weights)")
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args()
     torch.manual_seed(args.seed)
@@ -224,6 +260,7 @@ def main():
     m = {"num_samples": args.num_samples, "reconstruction": {}, "generation": {},
          "resources": {k: dict(models[k][1]["stats"]) for k in models}}
 
+    # 1. Reconstruct the test patients and time each model
     recon = {}
     for key in (*VAES, "vqvae"):
         model, stats = models[key][0], {}
@@ -243,6 +280,7 @@ def main():
     for i in examples:
         print(f"{test_names[i]:32s}" + "".join(f"{recon[k][1][i]:15.3f}" for k in recon))
 
+    # 2. Generate samples from every model
     sizes = [min(args.batch_size, args.num_samples - i) for i in range(0, args.num_samples, args.batch_size)]
     samples = {}
     for key in VAES:
@@ -261,6 +299,7 @@ def main():
     m["resources"]["prior"].update(generation_ms_per_image=1000 * t_vq / args.num_samples,
                                    peak_inference_vram_mb=stats["peak_vram_mb"])
 
+    # 3. Memorisation audit (threshold from real test slices)
     real_nn, _ = nearest_ssim(test, train)
     threshold = torch.quantile(real_nn, 0.99).item()
     m["memorisation_threshold"] = threshold
@@ -272,6 +311,7 @@ def main():
         m["generation"][key] = generation_stats(nn_train, imgs, threshold)
         m["generation"][key]["nn_ssim_test"] = summarise(nearest_ssim(imgs, test)[0])
 
+    # 4. Distribution match on Inception features
     if not args.no_fid:
         inception = InceptionFeatures().to(DEVICE)
         reference = inception(train[torch.randperm(len(train))[:2000]])
@@ -280,6 +320,7 @@ def main():
             m["generation"][key].update(fid=frechet_distance(features, reference),
                                         **density_coverage(reference, features))
 
+    # 5. Codebook usage: generated vs training code grids
     k = vqvae.quantizer.num_embeddings
     train_codes = batched(lambda x: vqvae.encode_indices(x.float()), train)
     p_train = torch.bincount(train_codes.flatten(), minlength=k).double()
@@ -290,6 +331,7 @@ def main():
                      "kl_train_to_generated": (p_train[used] * (p_train[used] / p_gen[used].clamp_min(1e-10)).log())
                      .sum().item()}
 
+    # 6. Figures
     for name, idx in (("reconstructions", examples), ("worst_reconstructions", s_vq.argsort()[:6])):
         image_grid([[test[i] for i in idx]] + [[recon[k][0][i] for i in idx] for k in recon]
                    + [[(3 * (rec_vq[i] - test[i].float()).abs()).clamp(0, 1) for i in idx]],
@@ -347,6 +389,7 @@ def main():
     image_grid(rows, titles, os.path.join(figs, "interpolation_sample_to_train.png"),
                "VQ-VAE: generated sample (t=0) to its nearest training scan (t=1)")
 
+    # 7. Save results
     cases = {"worst_reconstructions": [{"slice": test_names[i], **{f"ssim_{k}": recon[k][1][i].item() for k in recon}}
                                        for i in s_vq.argsort()[:20].tolist()],
              "least_plausible_vqvae": [{"sample": i, "nn_ssim_train": audit["vqvae"][1][i].item(),

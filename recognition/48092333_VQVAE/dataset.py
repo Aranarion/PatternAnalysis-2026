@@ -21,11 +21,12 @@ IMAGE_SHAPE = (256, 128)
 
 
 def patient_id(path):
+    """Patient ID from a file name, e.g. 'case_004_week_0_slice_12.nii.gz' -> 'case_004'."""
     return re.search(r"case_\d+", os.path.basename(path)).group(0)
 
 
 def split_paths(data_root=DATA_ROOT):
-    """Slice paths per split; fails if any patient appears in more than one split."""
+    """Sorted slice paths per provided split; raises ValueError if a patient appears in two splits."""
     paths = {}
     for split, folder in SPLITS.items():
         folder = os.path.join(data_root, folder)
@@ -37,7 +38,10 @@ def split_paths(data_root=DATA_ROOT):
 
 
 def load_slice(path):
-    """Adapted from load_data_2D in Appendix B of the specification."""
+    """Read a 2D Nifti slice as float32, dropping any trailing singleton axis.
+
+    Adapted from load_data_2D in Appendix B of the specification.
+    """
     image = nib.load(path).get_fdata(caching="unchanged")
     return (image[:, :, 0] if image.ndim == 3 else image).astype(np.float32)
 
@@ -53,7 +57,11 @@ def fit_to_shape(image, shape=IMAGE_SHAPE):
 
 
 def normalise(image):
-    """Clip to the 0.5-99.5th percentiles and rescale to [0, 1]."""
+    """Clip to the 0.5-99.5th percentiles and rescale to [0, 1].
+
+    MR intensities have no absolute scale, and clipping stops bright outliers
+    compressing the soft-tissue contrast.
+    """
     lo, hi = np.percentile(image, [0.5, 99.5])
     return np.clip((image - lo) / max(hi - lo, 1e-6), 0, 1)
 
@@ -84,7 +92,11 @@ class HipMRISlices(Dataset):
 
 
 def get_datasets(data_root=DATA_ROOT, max_slices=None, augment=False, splits=tuple(SPLITS), seed=42):
-    """Datasets per split; `max_slices` keeps a fixed random subset of each split."""
+    """Datasets per split; `max_slices` keeps a fixed random subset of each split.
+
+    Subsets are drawn before filtering by `splits`, so they are identical whichever
+    splits are loaded.
+    """
     generator = torch.Generator().manual_seed(seed)
     datasets = {}
     for split, paths in split_paths(data_root).items():
@@ -97,6 +109,7 @@ def get_datasets(data_root=DATA_ROOT, max_slices=None, augment=False, splits=tup
 
 
 def get_dataloaders(batch_size=32, num_workers=4, **kwargs):
+    """DataLoaders per split (training shuffled, last partial batch dropped) plus the datasets."""
     datasets = get_datasets(**kwargs)
     loaders = {s: DataLoader(d, batch_size, shuffle=s == "train", drop_last=s == "train",
                              num_workers=num_workers, pin_memory=torch.cuda.is_available())

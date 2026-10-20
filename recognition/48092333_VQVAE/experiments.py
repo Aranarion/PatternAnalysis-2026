@@ -1,10 +1,12 @@
 """Side experiments behind the README's ablations; the main pipeline does not need them.
 
     python experiments.py regularisation --vqvae-ckpt outputs/vqvae/best.pt
+    python experiments.py regularisation --variants mirror+dropout+wd+dim64
     python experiments.py vae-sweep
 
 regularisation: trains five PixelCNN priors, adding one regulariser at a time, and
-    compares them on validation bits per code (the selection metric).
+    compares them on validation bits per code (the selection metric). The unregularised
+    and final priors are also audited for memorisation at several training epochs.
 vae-sweep: trains VAE baselines at KL weights 1, 0.1 and 0.01 and benchmarks each on the
     test patients with the same reference set.
 
@@ -21,8 +23,8 @@ import torch
 import train
 from dataset import get_datasets
 from modules import MODELS, load_model
-from predict import (InceptionFeatures, batched, density_coverage, frechet_distance, generation_stats, image_grid,
-                     nearest_ssim, summarise)
+from predict import (InceptionFeatures, audit_prior, batched, density_coverage, frechet_distance, generation_stats,
+                     image_grid, nearest_ssim, summarise)
 from train import DEVICE, psnr, ssim
 
 PRIOR_VARIANTS = {
@@ -32,6 +34,8 @@ PRIOR_VARIANTS = {
     "mirror+dropout+wd": dict(mirror=True, dropout=0.2, weight_decay=0.01, dim=128),
     "mirror+dropout+wd+dim64": dict(mirror=True, dropout=0.2, weight_decay=0.01, dim=64),
 }
+AUDITED_VARIANTS = ("none", "mirror+dropout+wd+dim64")
+AUDIT_EPOCHS = (8, 20, 25, 50, 100)
 KL_WEIGHTS = (1.0, 0.1, 0.01)
 
 
@@ -42,13 +46,18 @@ def write_table(out, name, lines):
     print("\n".join(lines))
 
 
-def regularisation(out, vqvae_ckpt, train_args):
+def regularisation(out, vqvae_ckpt, train_args, variants=None, **audit_args):
     lines = ["| Prior | Best epoch | Min validation bits/code | Test bits/code | Final val - train gap "
              "| Parameters | s/epoch |", "|---|---|---|---|---|---|---|"]
+    memorisation = ["| Prior | Epoch | Validation bits/code | Possible copies | Near-duplicates | Mean NN-SSIM "
+                    "| Max NN-SSIM | Pairwise SSIM |", "|---|---|---|---|---|---|---|---|"]
     for name, v in PRIOR_VARIANTS.items():
+        if variants and name not in variants:
+            continue
         run = os.path.join(out, name)
+        save = ["--save-epochs", *map(str, AUDIT_EPOCHS)] if name in AUDITED_VARIANTS else []
         args = train.parse_args(["--model", "prior", "--vqvae-ckpt", vqvae_ckpt, "--out-dir", run,
-                                 "--prior-dim", str(v["dim"]), *train_args])
+                                 "--prior-dim", str(v["dim"]), *save, *train_args])
         torch.manual_seed(args.seed)
         loaders, extra, num_embeddings = train.prior_loaders(vqvae_ckpt, args.batch_size, v["mirror"])
         config = dict(num_embeddings=num_embeddings, dim=v["dim"], n_layers=args.prior_layers, dropout=v["dropout"])
@@ -62,7 +71,16 @@ def regularisation(out, vqvae_ckpt, train_args):
         lines.append(f"| {name} | {best['epoch']} | {best['val_bits_per_code']:.3f} | "
                      f"{ckpt['test']['bits_per_code']:.3f} | {gap:.2f} | {ckpt['stats']['parameters']:,} | "
                      f"{sum(r['epoch_s'] for r in history) / len(history):.0f} |")
+        for epoch in AUDIT_EPOCHS if name in AUDITED_VARIANTS else ():
+            r = audit_prior(vqvae_ckpt, os.path.join(run, "prior", f"epoch_{epoch}.pt"), **audit_args)
+            with open(os.path.join(run, "prior", f"memorisation_epoch_{epoch}.json"), "w") as f:
+                json.dump(r, f, indent=2)
+            memorisation.append(f"| {name} | {epoch} | {history[epoch - 1]['val_bits_per_code']:.3f} | "
+                                f"{100 * r['frac_possible_copy']:.1f}% | {100 * r['frac_near_duplicate']:.1f}% | "
+                                f"{r['nn_ssim_train']['mean']:.3f} | {r['nn_ssim_train']['max']:.3f} | "
+                                f"{r['pairwise_ssim']:.3f} |")
     write_table(out, "regularisation.md", lines)
+    write_table(out, "memorisation.md", memorisation)
 
 
 @torch.no_grad()
@@ -116,9 +134,11 @@ if __name__ == "__main__":
     p.add_argument("experiment", choices=["regularisation", "vae-sweep"])
     p.add_argument("--out-dir", default="outputs_experiments")
     p.add_argument("--vqvae-ckpt", default="outputs/vqvae/best.pt")
+    p.add_argument("--variants", nargs="*", choices=list(PRIOR_VARIANTS), help="only these priors (default: all)")
     args = p.parse_args()
     torch.backends.cudnn.benchmark = True
     if args.experiment == "regularisation":
-        regularisation(os.path.join(args.out_dir, "regularisation"), args.vqvae_ckpt, ["--epochs", "100", "--lr", "3e-4"])
+        regularisation(os.path.join(args.out_dir, "regularisation"), args.vqvae_ckpt, ["--epochs", "100", "--lr", "3e-4"],
+                       args.variants)
     else:
         vae_sweep(os.path.join(args.out_dir, "vae_sweep"), ["--epochs", "50"])

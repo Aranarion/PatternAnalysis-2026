@@ -9,4 +9,6 @@
 set -eo pipefail
 cd "$SLURM_SUBMIT_DIR"
 source slurm/env.sh
-python train.py --model vae --out-dir $OUT --downsample $DOWNSAMPLE --epochs 50
+for w in 0.1 0.01; do
+    python train.py --model vae --kl-weight $w --out-dir $OUT --downsample $DOWNSAMPLE --epochs 50
+done

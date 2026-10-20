@@ -1,10 +1,12 @@
 """Train the VAE baseline, the VQ-VAE, or the PixelCNN prior over VQ-VAE codes.
 
-    python train.py --model vae
+    python train.py --model vae --kl-weight 0.1
+    python train.py --model vae --kl-weight 0.01
     python train.py --model vqvae
     python train.py --model prior --vqvae-ckpt outputs/vqvae/best.pt
 
-Writes best.pt (lowest validation loss), history.json and curves.png to <out-dir>/<model>/.
+Writes best.pt (lowest validation loss), history.json and curves.png to <out-dir>/<model>/,
+where VAEs are saved as vae_kl<weight>.
 """
 
 import argparse
@@ -64,7 +66,7 @@ def peak_vram(stats, key="peak_vram_mb"):
     stats[key] = torch.cuda.max_memory_allocated() / 2 ** 20 if DEVICE.type == "cuda" else None
 
 
-def parse_args():
+def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--model", required=True, choices=list(MODELS))
     p.add_argument("--data-root", default=DATA_ROOT)
@@ -79,13 +81,13 @@ def parse_args():
     p.add_argument("--downsample", type=int, default=4)
     p.add_argument("--num-embeddings", type=int, default=512)
     p.add_argument("--embedding-dim", type=int, default=64, help="also the VAE latent channels")
-    p.add_argument("--kl-weight", type=float, default=1.0)
+    p.add_argument("--kl-weight", type=float, default=0.1, help="the benchmark uses 0.1 and 0.01")
     p.add_argument("--kl-warmup", type=int, default=5, help="epochs of linear KL warm-up")
     p.add_argument("--vqvae-ckpt")
     p.add_argument("--prior-dim", type=int, default=64)
     p.add_argument("--prior-layers", type=int, default=15)
     p.add_argument("--save-epochs", type=int, nargs="*", default=[], help="also save checkpoints at these epochs")
-    return p.parse_args()
+    return p.parse_args(argv)
 
 
 def autoencoder_step(model, kind, x, kl_weight):
@@ -145,11 +147,26 @@ def plot_history(history, path):
     plt.close(fig)
 
 
-def fit(model, config, loaders, step, args, extra):
-    out_dir = os.path.join(args.out_dir, args.model)
+def prior_loaders(vqvae_ckpt, batch_size, mirror=True):
+    """Code grids of every split from a trained VQ-VAE; `mirror` adds left-right flipped training grids."""
+    vqvae, vq_ckpt = load_model(vqvae_ckpt, DEVICE)
+    a = vq_ckpt["args"]
+    datasets = get_datasets(a["data_root"], a["max_slices"], seed=a["seed"])
+    codes = {s: torch.cat([vqvae.encode_indices(x.to(DEVICE)).cpu() for x in DataLoader(d, 64)])
+             for s, d in datasets.items()}
+    if mirror:
+        mirrored = [vqvae.encode_indices(x.flip(-2).to(DEVICE)).cpu() for x in DataLoader(datasets["train"], 64)]
+        codes["train"] = torch.cat([codes["train"], *mirrored])
+    loaders = {s: DataLoader(c, batch_size, shuffle=s == "train", drop_last=s == "train") for s, c in codes.items()}
+    extra = {"grid_shape": tuple(codes["train"].shape[1:]), "vqvae_ckpt": os.path.abspath(vqvae_ckpt)}
+    return loaders, extra, vqvae.quantizer.num_embeddings
+
+
+def fit(model, config, loaders, step, args, extra, weight_decay=0.0):
+    name = f"vae_kl{args.kl_weight:g}" if args.model == "vae" else args.model
+    out_dir = os.path.join(args.out_dir, name)
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, "best.pt")
-    weight_decay = 0.01 if args.model == "prior" else 0.0
     optimiser = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimiser, args.epochs)
     history, best, start = [], float("inf"), time.time()
@@ -185,24 +202,14 @@ def fit(model, config, loaders, step, args, extra):
     print("stats:", ckpt["stats"])
 
 
-def main():
-    args = parse_args()
+def main(argv=None):
+    args = parse_args(argv)
     torch.manual_seed(args.seed)
     torch.backends.cudnn.benchmark = True
 
     if args.model == "prior":
-        vqvae, vq_ckpt = load_model(args.vqvae_ckpt, DEVICE)
-        vq_args = vq_ckpt["args"]
-        datasets = get_datasets(vq_args["data_root"], vq_args["max_slices"], seed=vq_args["seed"])
-        codes = {s: torch.cat([vqvae.encode_indices(x.to(DEVICE)).cpu() for x in DataLoader(d, 64)])
-                 for s, d in datasets.items()}
-        mirrored = [vqvae.encode_indices(x.flip(-2).to(DEVICE)).cpu() for x in DataLoader(datasets["train"], 64)]
-        codes["train"] = torch.cat([codes["train"], *mirrored])
-        loaders = {s: DataLoader(c, args.batch_size, shuffle=s == "train", drop_last=s == "train")
-                   for s, c in codes.items()}
-        config = dict(num_embeddings=vqvae.quantizer.num_embeddings, dim=args.prior_dim,
-                      n_layers=args.prior_layers)
-        extra = {"grid_shape": tuple(codes["train"].shape[1:]), "vqvae_ckpt": os.path.abspath(args.vqvae_ckpt)}
+        loaders, extra, num_embeddings = prior_loaders(args.vqvae_ckpt, args.batch_size)
+        config = dict(num_embeddings=num_embeddings, dim=args.prior_dim, n_layers=args.prior_layers)
 
         def step(model, batch, epoch):
             return prior_step(model, batch)
@@ -222,7 +229,7 @@ def main():
 
     model = MODELS[args.model](**config).to(DEVICE)
     print(f"{args.model}: {count_parameters(model):,} parameters on {DEVICE}")
-    fit(model, config, loaders, step, args, extra)
+    fit(model, config, loaders, step, args, extra, weight_decay=0.01 if args.model == "prior" else 0.0)
 
 
 if __name__ == "__main__":

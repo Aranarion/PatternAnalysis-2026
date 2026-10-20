@@ -21,6 +21,10 @@ from dataset import get_datasets, patient_id
 from modules import load_model
 from train import DEVICE, count_parameters, peak_vram, psnr, ssim, sync
 
+VAES = ("vae_kl0.1", "vae_kl0.01")
+NAMES = {"vae_kl0.1": "VAE (KL 0.1)", "vae_kl0.01": "VAE (KL 0.01)", "vqvae": "VQ-VAE",
+         "prior": "PixelCNN prior", "test_real": "Real test slices"}
+
 
 def summarise(values):
     return {"mean": values.mean().item(), "std": values.std().item(),
@@ -146,7 +150,7 @@ def write_markdown(m, path):
     r, g, res = m["reconstruction"], m["generation"], m["resources"]
     lines = ["### Reconstruction of unseen test patients", "",
              "| Model | SSIM | PSNR (dB) | Slices with SSIM > 0.6 |", "|---|---|---|---|"]
-    lines += [f"| {k.upper()} | {ms(v['ssim'])} | {ms(v['psnr'], 2)} | {pct(v['frac_ssim_above_0.6'])} |"
+    lines += [f"| {NAMES[k]} | {ms(v['ssim'])} | {ms(v['psnr'], 2)} | {pct(v['frac_ssim_above_0.6'])} |"
               for k, v in r.items()]
     rows = [("SSIM to nearest training slice", lambda s: ms(s["nn_ssim_train"])),
             ("SSIM to nearest test slice", lambda s: ms(s["nn_ssim_test"]) if "nn_ssim_test" in s else "n/a"),
@@ -159,14 +163,16 @@ def write_markdown(m, path):
         rows += [("FID vs training slices (relative only)", lambda s: f"{s['fid']:.1f}"),
                  ("Density", lambda s: f"{s['density']:.3f}"),
                  ("Coverage", lambda s: f"{s['coverage']:.3f}")]
+    cols = ("test_real", *VAES, "vqvae")
     lines += ["", f"### Generation ({m['num_samples']} uncurated samples per model)", "",
-              "| Metric | Real test slices | VAE | VQ-VAE + PixelCNN |", "|---|---|---|---|"]
-    lines += [f"| {label} | {fn(g['test_real'])} | {fn(g['vae'])} | {fn(g['vqvae'])} |" for label, fn in rows]
+              "| Metric | " + " | ".join({**NAMES, "vqvae": "VQ-VAE + PixelCNN"}[c] for c in cols) + " |",
+              "|---" * (len(cols) + 1) + "|"]
+    lines += [f"| {label} | " + " | ".join(fn(g[c]) for c in cols) + " |" for label, fn in rows]
     lines += ["", "### Resources", "",
               "| Model | Parameters | Peak train VRAM (MB) | Train time (min) | Reconstruction, batch 1 (ms) "
               "| Generation per image (ms) | Peak inference VRAM (MB) |", "|---|---|---|---|---|---|---|"]
     for k, v in res.items():
-        lines.append(f"| {k.upper()} | {v['parameters']:,} | {num(v.get('peak_train_vram_mb'), 0)} "
+        lines.append(f"| {NAMES[k]} | {v['parameters']:,} | {num(v.get('peak_train_vram_mb'), 0)} "
                      f"| {num(v['train_time_s'] / 60)} | {num(v.get('recon_latency_ms'), 2)} "
                      f"| {num(v.get('generation_ms_per_image'), 2)} | {num(v.get('peak_inference_vram_mb'), 0)} |")
     with open(path, "w", encoding="utf-8") as f:
@@ -197,40 +203,6 @@ def audit_prior(args):
 
 
 @torch.no_grad()
-def evaluate_vae(args):
-    """Benchmark one VAE checkpoint (e.g. a different KL weight) on the test patients."""
-    vae, ckpt = load_model(args.vae_ckpt, DEVICE)
-    a, name = ckpt["args"], f"vae_kl{ckpt['args']['kl_weight']:g}"
-    data = get_datasets(a["data_root"], a["max_slices"], splits=("train", "test"), seed=a["seed"])
-    train, test = data["train"].images, data["test"].images
-    rec = batched(lambda x: vae(x.float())[0], test)
-    scores = ssim(rec, test)
-    sizes = [min(args.batch_size, args.num_samples - i) for i in range(0, args.num_samples, args.batch_size)]
-    samples = torch.cat([vae.sample(k, DEVICE).cpu() for k in sizes])
-    threshold = torch.quantile(nearest_ssim(test, train)[0], 0.99).item()
-    result = {"vae_ckpt": args.vae_ckpt, "kl_weight": a["kl_weight"], "epoch": ckpt["epoch"],
-              "reconstruction": {"ssim": summarise(scores), "psnr": summarise(psnr(rec, test)),
-                                 "frac_ssim_above_0.6": (scores > 0.6).float().mean().item()},
-              "generation": generation_stats(nearest_ssim(samples, train)[0], samples, threshold)}
-    if not args.no_fid:
-        inception = InceptionFeatures().to(DEVICE)
-        reference = inception(train[torch.randperm(len(train))[:2000]])
-        features = inception(samples)
-        result["generation"].update(fid=frechet_distance(features, reference),
-                                    **density_coverage(reference, features))
-    out = os.path.join(args.out_dir, "predict")
-    os.makedirs(os.path.join(out, "figures"), exist_ok=True)
-    idx = torch.linspace(0, len(test) - 1, 8).long()
-    image_grid([[test[i] for i in idx], [rec[i] for i in idx], list(samples[:8]), list(samples[8:16])],
-               [[f"test {i}" for i in idx], [f"recon SSIM {scores[i]:.3f}" for i in idx]] + [[""] * 8] * 2,
-               os.path.join(out, "figures", f"{name}.png"),
-               f"VAE (KL weight {a['kl_weight']:g}): test slices, reconstructions, 16 uncurated samples")
-    with open(os.path.join(out, f"{name}.json"), "w") as f:
-        json.dump(result, f, indent=2)
-    print(json.dumps(result, indent=2))
-
-
-@torch.no_grad()
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--out-dir", default="outputs")
@@ -240,19 +212,16 @@ def main():
     p.add_argument("--no-fid", action="store_true")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--prior-ckpt", help="only run the memorisation audit for this prior checkpoint")
-    p.add_argument("--vae-ckpt", help="only benchmark this VAE checkpoint")
     args = p.parse_args()
     torch.manual_seed(args.seed)
     if args.prior_ckpt:
         return audit_prior(args)
-    if args.vae_ckpt:
-        return evaluate_vae(args)
     out = os.path.join(args.out_dir, "predict")
     figs = os.path.join(out, "figures")
     os.makedirs(figs, exist_ok=True)
 
-    models = {k: load_model(os.path.join(args.out_dir, k, "best.pt"), DEVICE) for k in ("vae", "vqvae", "prior")}
-    vae, vqvae, prior = (models[k][0] for k in ("vae", "vqvae", "prior"))
+    models = {k: load_model(os.path.join(args.out_dir, k, "best.pt"), DEVICE) for k in (*VAES, "vqvae", "prior")}
+    vqvae, prior = models["vqvae"][0], models["prior"][0]
     a = models["vqvae"][1]["args"]
     data = get_datasets(a["data_root"], a["max_slices"], splits=("train", "test"), seed=a["seed"])
     train, test = data["train"].images, data["test"].images
@@ -262,8 +231,8 @@ def main():
          "resources": {k: dict(models[k][1]["stats"]) for k in models}}
 
     recon = {}
-    for key, model in (("vae", vae), ("vqvae", vqvae)):
-        stats = {}
+    for key in (*VAES, "vqvae"):
+        model, stats = models[key][0], {}
         with peak_vram(stats):
             rec = batched(lambda x: model(x.float())[0], test)
         scores = ssim(rec, test)
@@ -274,14 +243,17 @@ def main():
         m["resources"][key].update(recon_latency_ms=time_ms(lambda: model(x1)),
                                    peak_inference_vram_mb=stats["peak_vram_mb"])
 
-    (rec_vae, s_vae), (rec_vq, s_vq) = recon["vae"], recon["vqvae"]
+    rec_vq, s_vq = recon["vqvae"]
     examples = torch.linspace(0, len(test) - 1, 6).long()
-    print(f"{'test slice':32s} {'VAE SSIM':>9s} {'VQ-VAE SSIM':>12s}")
+    print(f"{'test slice (SSIM)':32s}" + "".join(f"{NAMES[k]:>15s}" for k in recon))
     for i in examples:
-        print(f"{test_names[i]:32s} {s_vae[i]:9.3f} {s_vq[i]:12.3f}")
+        print(f"{test_names[i]:32s}" + "".join(f"{recon[k][1][i]:15.3f}" for k in recon))
 
     sizes = [min(args.batch_size, args.num_samples - i) for i in range(0, args.num_samples, args.batch_size)]
-    vae_samples, t_vae = timed(lambda: torch.cat([vae.sample(k, DEVICE).cpu() for k in sizes]))
+    samples = {}
+    for key in VAES:
+        samples[key], t = timed(lambda: torch.cat([models[key][0].sample(k, DEVICE).cpu() for k in sizes]))
+        m["resources"][key]["generation_ms_per_image"] = 1000 * t / args.num_samples
     generator = torch.Generator(device=DEVICE).manual_seed(args.seed)
 
     def generate_vqvae():
@@ -291,8 +263,7 @@ def main():
 
     stats = {}
     with peak_vram(stats):
-        (vq_codes, vq_samples), t_vq = timed(generate_vqvae)
-    m["resources"]["vae"]["generation_ms_per_image"] = 1000 * t_vae / args.num_samples
+        (vq_codes, samples["vqvae"]), t_vq = timed(generate_vqvae)
     m["resources"]["prior"].update(generation_ms_per_image=1000 * t_vq / args.num_samples,
                                    peak_inference_vram_mb=stats["peak_vram_mb"])
 
@@ -301,16 +272,16 @@ def main():
     m["memorisation_threshold"] = threshold
     m["generation"]["test_real"] = generation_stats(real_nn, test, threshold)
     audit = {}
-    for key, samples in (("vae", vae_samples), ("vqvae", vq_samples)):
-        nn_train, nn_idx = nearest_ssim(samples, train)
-        audit[key] = (samples, nn_train, nn_idx)
-        m["generation"][key] = generation_stats(nn_train, samples, threshold)
-        m["generation"][key]["nn_ssim_test"] = summarise(nearest_ssim(samples, test)[0])
+    for key, imgs in samples.items():
+        nn_train, nn_idx = nearest_ssim(imgs, train)
+        audit[key] = (imgs, nn_train, nn_idx)
+        m["generation"][key] = generation_stats(nn_train, imgs, threshold)
+        m["generation"][key]["nn_ssim_test"] = summarise(nearest_ssim(imgs, test)[0])
 
     if not args.no_fid:
         inception = InceptionFeatures().to(DEVICE)
         reference = inception(train[torch.randperm(len(train))[:2000]])
-        for key, images in (("test_real", test), ("vae", vae_samples), ("vqvae", vq_samples)):
+        for key, images in (("test_real", test), *samples.items()):
             features = inception(images)
             m["generation"][key].update(fid=frechet_distance(features, reference),
                                         **density_coverage(reference, features))
@@ -326,25 +297,25 @@ def main():
                      .sum().item()}
 
     for name, idx in (("reconstructions", examples), ("worst_reconstructions", s_vq.argsort()[:6])):
-        image_grid([[test[i] for i in idx], [rec_vae[i] for i in idx], [rec_vq[i] for i in idx],
-                    [(3 * (rec_vq[i] - test[i].float()).abs()).clamp(0, 1) for i in idx]],
-                   [[test_names[i] for i in idx], [f"VAE {s_vae[i]:.3f}" for i in idx],
-                    [f"VQ-VAE {s_vq[i]:.3f}" for i in idx], ["|VQ-VAE error| x3"] * len(idx)],
-                   os.path.join(figs, f"{name}.png"), f"{name.replace('_', ' ').capitalize()}: input, VAE, VQ-VAE, error")
+        image_grid([[test[i] for i in idx]] + [[recon[k][0][i] for i in idx] for k in recon]
+                   + [[(3 * (rec_vq[i] - test[i].float()).abs()).clamp(0, 1) for i in idx]],
+                   [[test_names[i] for i in idx]] + [[f"{NAMES[k]} {recon[k][1][i]:.3f}" for i in idx] for k in recon]
+                   + [["|VQ-VAE error| x3"] * len(idx)],
+                   os.path.join(figs, f"{name}.png"),
+                   f"{name.replace('_', ' ').capitalize()}: input, " + ", ".join(NAMES[k] for k in recon) + ", error")
 
-    for key, (samples, nn_train, nn_idx) in audit.items():
-        image_grid([list(samples[r * 8:(r + 1) * 8]) for r in range(4)], [[""] * 8] * 4,
-                   os.path.join(figs, f"samples_{key}.png"), f"{key.upper()}: first 32 samples (uncurated)")
+    for key, (imgs, nn_train, nn_idx) in audit.items():
+        image_grid([list(imgs[r * 8:(r + 1) * 8]) for r in range(4)], [[""] * 8] * 4,
+                   os.path.join(figs, f"samples_{key}.png"), f"{NAMES[key]}: first 32 samples (uncurated)")
         order = nn_train.argsort(descending=True)
         for name, idx in (("closest_to_train", order[:6]), ("least_plausible", order[-6:])):
-            image_grid([[samples[i] for i in idx], [train[nn_idx[i]] for i in idx]],
+            image_grid([[imgs[i] for i in idx], [train[nn_idx[i]] for i in idx]],
                        [[f"NN-SSIM {nn_train[i]:.3f}" for i in idx], [train_names[nn_idx[i]] for i in idx]],
                        os.path.join(figs, f"{name}_{key}.png"),
-                       f"{key.upper()} {name.replace('_', ' ')}: sample (top), nearest training slice (bottom)")
+                       f"{NAMES[key]} {name.replace('_', ' ')}: sample (top), nearest training slice (bottom)")
 
     fig, ax = plt.subplots(figsize=(6, 4))
-    for label, values in (("real test slices", real_nn), ("VAE samples", audit["vae"][1]),
-                          ("VQ-VAE samples", audit["vqvae"][1])):
+    for label, values in (("real test slices", real_nn), *((f"{NAMES[k]} samples", v[1]) for k, v in audit.items())):
         ax.hist(values.numpy(), bins=40, range=(0, 1), alpha=0.5, density=True, label=label)
     ax.axvline(threshold, color="k", ls="--", label="memorisation threshold")
     ax.set(xlabel="SSIM to nearest training slice", ylabel="density")
@@ -355,12 +326,17 @@ def main():
 
     j = next(i for i, n in enumerate(test_names) if patient_id(n) != patient_id(test_names[0]))
     ends = test[[0, j]].to(DEVICE).float()
-    mu, ze = vae.encode(ends)[0], vqvae.encode(ends)
     steps = torch.linspace(0, 1, 8).tolist()
-    image_grid([[vae.decoder((1 - t) * mu[:1] + t * mu[1:])[0].cpu() for t in steps],
-                [vqvae.decode_latents((1 - t) * ze[:1] + t * ze[1:])[0].cpu() for t in steps]],
-               [[f"VAE t={t:.2f}" for t in steps], [f"VQ-VAE t={t:.2f}" for t in steps]],
-               os.path.join(figs, "interpolation.png"), "Latent interpolation between two test patients")
+    rows, titles = [], []
+    for key in VAES:
+        vae = models[key][0]
+        mu = vae.encode(ends)[0]
+        rows.append([vae.decoder((1 - t) * mu[:1] + t * mu[1:])[0].cpu() for t in steps])
+        titles.append([f"{NAMES[key]}\nt={t:.2f}" for t in steps])
+    ze = vqvae.encode(ends)
+    rows.append([vqvae.decode_latents((1 - t) * ze[:1] + t * ze[1:])[0].cpu() for t in steps])
+    titles.append([f"VQ-VAE\nt={t:.2f}" for t in steps])
+    image_grid(rows, titles, os.path.join(figs, "interpolation.png"), "Latent interpolation between two test patients")
 
     vq_nn, vq_idx = audit["vqvae"][1], audit["vqvae"][2]
     rows, titles, m["interpolation_ssim_to_train"] = [], [], {}
@@ -377,8 +353,8 @@ def main():
     image_grid(rows, titles, os.path.join(figs, "interpolation_sample_to_train.png"),
                "VQ-VAE: generated sample (t=0) to its nearest training scan (t=1)")
 
-    cases = {"worst_reconstructions": [{"slice": test_names[i], "ssim_vqvae": s_vq[i].item(),
-                                        "ssim_vae": s_vae[i].item()} for i in s_vq.argsort()[:20].tolist()],
+    cases = {"worst_reconstructions": [{"slice": test_names[i], **{f"ssim_{k}": recon[k][1][i].item() for k in recon}}
+                                       for i in s_vq.argsort()[:20].tolist()],
              "least_plausible_vqvae": [{"sample": i, "nn_ssim_train": audit["vqvae"][1][i].item(),
                                         "nearest_train_slice": train_names[audit["vqvae"][2][i]]}
                                        for i in audit["vqvae"][1].argsort()[:20].tolist()]}

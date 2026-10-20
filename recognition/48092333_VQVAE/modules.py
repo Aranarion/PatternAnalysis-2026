@@ -219,7 +219,7 @@ class GatedLayer(nn.Module):
 class GatedPixelCNN(nn.Module):
     """Autoregressive prior over VQ-VAE code grids."""
 
-    def __init__(self, num_embeddings=512, dim=128, n_layers=15, kernel_size=5, dropout=0.0):
+    def __init__(self, num_embeddings=512, dim=64, n_layers=15, kernel_size=5, dropout=0.2):
         super().__init__()
         self.embedding = nn.Embedding(num_embeddings, dim)
         self.layers = nn.ModuleList(

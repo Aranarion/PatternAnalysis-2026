@@ -82,12 +82,9 @@ def parse_args():
     p.add_argument("--kl-weight", type=float, default=1.0)
     p.add_argument("--kl-warmup", type=int, default=5, help="epochs of linear KL warm-up")
     p.add_argument("--vqvae-ckpt")
-    p.add_argument("--prior-dim", type=int, default=128)
+    p.add_argument("--prior-dim", type=int, default=64)
     p.add_argument("--prior-layers", type=int, default=15)
     p.add_argument("--save-epochs", type=int, nargs="*", default=[], help="also save checkpoints at these epochs")
-    p.add_argument("--prior-dropout", type=float, default=0.0)
-    p.add_argument("--weight-decay", type=float, default=0.0, help="AdamW decoupled weight decay")
-    p.add_argument("--patience", type=int, default=0, help="stop after this many epochs without improvement (0 = off)")
     return p.parse_args()
 
 
@@ -152,9 +149,10 @@ def fit(model, config, loaders, step, args, extra):
     out_dir = os.path.join(args.out_dir, args.model)
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, "best.pt")
-    optimiser = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    weight_decay = 0.01 if args.model == "prior" else 0.0
+    optimiser = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimiser, args.epochs)
-    history, best, best_epoch, start = [], float("inf"), 0, time.time()
+    history, best, start = [], float("inf"), time.time()
 
     for epoch in range(1, args.epochs + 1):
         stats, t0 = {}, time.time()
@@ -169,13 +167,10 @@ def fit(model, config, loaders, step, args, extra):
         ckpt = {"kind": args.model, "config": config, "state_dict": model.state_dict(),
                 "epoch": epoch, "args": vars(args), **extra}
         if val["loss"] < best:
-            best, best_epoch = val["loss"], epoch
+            best = val["loss"]
             torch.save(ckpt, path)
         if epoch in args.save_epochs:
             torch.save(ckpt, os.path.join(out_dir, f"epoch_{epoch}.pt"))
-        if args.patience and epoch - best_epoch >= args.patience:
-            print(f"early stopping: no improvement for {args.patience} epochs", flush=True)
-            break
 
     model, ckpt = load_model(path, DEVICE)
     ckpt["test"] = run_epoch(model, loaders["test"], step)
@@ -201,13 +196,12 @@ def main():
         datasets = get_datasets(vq_args["data_root"], vq_args["max_slices"], seed=vq_args["seed"])
         codes = {s: torch.cat([vqvae.encode_indices(x.to(DEVICE)).cpu() for x in DataLoader(d, 64)])
                  for s, d in datasets.items()}
-        if args.augment:
-            mirrored = [vqvae.encode_indices(x.flip(-2).to(DEVICE)).cpu() for x in DataLoader(datasets["train"], 64)]
-            codes["train"] = torch.cat([codes["train"], *mirrored])
+        mirrored = [vqvae.encode_indices(x.flip(-2).to(DEVICE)).cpu() for x in DataLoader(datasets["train"], 64)]
+        codes["train"] = torch.cat([codes["train"], *mirrored])
         loaders = {s: DataLoader(c, args.batch_size, shuffle=s == "train", drop_last=s == "train")
                    for s, c in codes.items()}
         config = dict(num_embeddings=vqvae.quantizer.num_embeddings, dim=args.prior_dim,
-                      n_layers=args.prior_layers, dropout=args.prior_dropout)
+                      n_layers=args.prior_layers)
         extra = {"grid_shape": tuple(codes["train"].shape[1:]), "vqvae_ckpt": os.path.abspath(args.vqvae_ckpt)}
 
         def step(model, batch, epoch):

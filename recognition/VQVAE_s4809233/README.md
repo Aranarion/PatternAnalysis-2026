@@ -223,7 +223,7 @@ Furthermore, adding all 4 forms of regularisation together improved generation (
 #### 1.5 Latent Interpolation Between Synthetic and Training Slices
 ![Sample-to-training interpolation](figures/interpolation_sample_to_train.png)
 
-SSIM to the nearest training scan rises gradually along each path (e.g. 0.22 → 0.91), and even the sample closest to the training set starts at only 0.42, so generated slices are not copies of training scans.
+SSIM to the training slice clearly increases from the generated slice to its nearest training slice, and both sides are demonstrably different further suggesting a lack of memorisation.
 
 ### 2\. Resource Profiling
 
@@ -256,7 +256,7 @@ SSIM to the nearest training scan rises gradually along each path (e.g. 0.22 →
 | 4b. Density, coverage | > 50% of real | 40%, 47% |
 | 5. VRAM / time per slice | < 16 GB / < 1 s | 3.3 GB / 0.51 s |
 
-AC1, AC2, AC3 and AC5 were met by the VQ-VAE; AC4 was not, with pairwise SSIM just outside ±25% of real (25.2% below) and density and coverage being slightly under the set expectation.
+AC1, AC2, AC3 and AC5 were achieved by the VQ-VAE. However, AC4 was not with pairwise SSIM slightly outside ±25% of real (25.2% below) and density and coverage being slightly under the set expectation.
 
 #### 4.2 Conclusions
 

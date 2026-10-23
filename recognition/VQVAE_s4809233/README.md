@@ -17,7 +17,7 @@ Loss Function:
 3. **VAE:** learns a continuous latent representation by encoding each input into a probability distribution, sampling a latent vector and decoding it to reconstruct the input. Generated samples are formed by sampling and decoding the learnt latent distribution. In this investigation KL weights of 1, 0.1 and 0.01 were tested to improve baseline performance.
 Loss function:
 ```math
-\mathcal{L}_{\text{VAE}} = \frac{1}{N}\lVert x-\hat{x}\rVert_2^2 + \beta D_{\text{KL}}\big(q_\phi(z|x)\,\|\,p(z)\big), \qquad \beta\in\{1,\,0.1,\,0.01\}
+\mathcal{L}_{\text{VAE}} = \lVert x-\hat{x}\rVert_2^2 + \beta D_{\text{KL}}\big(q_\phi(z|x)\,\|\,p(z)\big), \qquad \beta\in\{1,\,0.1,\,0.01\}
 ```
 
 ### 3\. Algorithm Visualisation
@@ -56,8 +56,8 @@ flowchart LR
 2. **Generated-slice fidelity:** Mean SSIM of each sample to nearest real slice (> 0.2)
 3. **No Memorisation:**
 
-   * (a) Proportion of generated samples above 95th percentile NN-SSIM of validation patients (< test-patient rate)
-   * (b) Proportion of near-duplicate samples (NN-SSIM > 0.95) (< test-patient rate)
+   * (a) Proportion of generated samples above 99th percentile NN-SSIM of test patients (< test-patient rate)
+   * (b) Proportion of near-duplicate samples (NN-SSIM > 0.95) (0)
 4. **Coverage \& Density:**
 
    * (a) Mean Pairwise SSIM (within ±25% of Real Test Slices)
@@ -119,6 +119,8 @@ Run on Rangpur A100.
 | `experiments.py` | Prior regularisation, VAE KL optimisation |
 
 ```bash
+conda activate torch && pip install --no-cache-dir nibabel==5.4.2
+mkdir -p outputs/logs
 sbatch slurm/smoke_test.sbatch      # smoke test
 bash slurm/run_all.sh               # trains VAE, VQ-VAE, CNN prior, and runs predict.py
 sbatch slurm/experiments.sbatch     # side experiments: VAE KL optimisation, and prior regularisation
@@ -148,7 +150,7 @@ sbatch slurm/experiments.sbatch     # side experiments: VAE KL optimisation, and
 ### 5\. VQ-VAE Generated Slices
 ![VQ-VAE Generated Slices](figures/samples_vqvae.png)
 
-### 6\. VAE Generated Slices
+### 6\. VAE Generated Slices (KL 1, first run)
 ![VAE Generated Slices](figures/samples_vae.png)
 
 
@@ -156,8 +158,8 @@ sbatch slurm/experiments.sbatch     # side experiments: VAE KL optimisation, and
 
 1. Loaded Nifti slices with Nibabel
 2. Centre-cropped the 60 slices of dimensions 256 x 144 to 256 x 128 to make all 12660 slices have identical dimensions
-3. Normalised each slice by clipping to 0.5th-99.95th percentiles (to ensure outliers don't compress remaining contrast scale), then scaled pixel values to [0,1]. This is because calculating SSIM requires model inputs and output scales must match, as output is sigmoid values, input must be scaled to [0,1].
-4. Left-right mirrored inputs were also randomly sampled to be used for training the PixelCNN prior as overfitting was previously observed.
+3. Normalised each slice by clipping to 0.5th-99.5th percentiles (to ensure outliers don't compress remaining contrast scale), then scaled pixel values to [0,1]. This is because calculating SSIM requires model inputs and output scales must match, as output is sigmoid values, input must be scaled to [0,1].
+4. A left-right mirrored copy of every training slice was also added to the PixelCNN prior's training set as overfitting was previously observed.
 5. Ensured that the given training, validation, test split did not contain patient leakage.
 
 | Split | Slices | Patients | 
@@ -194,7 +196,7 @@ NOTE: All models reconstructed the same 540 test slices and generated 1000 synth
 
 #### 1.2 VQ-VAE Results Interpretation
 1. **Reconstruction**: VQ-VAE reconstructs every test slice with SSIM exceeding 0.6 (0.886 minimum, 0.917 average) satisfying task sheet requirement
-2. **Generation**: Only the VQ-VAE + PixelCNN Prior produces real anatomy as the VAE has no sample on the test (real)-data manifold (density 0) at all KL weights. The VQ-VAE + PixelCNN Prior reached 80\% of the test (real) patient NN-SSIM, 40\% of its density and 47\% of its coverage.
+2. **Generation**: Only the VQ-VAE + PixelCNN Prior produces real anatomy as the VAE has no sample on the real (training) data manifold (density 0) at all KL weights. The VQ-VAE + PixelCNN Prior reached 80\% of the test (real) patient NN-SSIM, 40\% of its density and 47\% of its coverage.
 
 #### 1.3 Baseline VAE KL Weight Optimisation
 | KL weight | Recon. SSIM | FID | Density / coverage |
@@ -217,6 +219,11 @@ Without regularisation, the PixelCNN Prior overfit as the validation bits/code i
 NOTE each subsequent row is cumulative of the regularisation techniques above (i.e. bottom row is with all 4 forms of regularisation combined
 
 Furthermore, adding all 4 forms of regularisation together improved generation (FID 135.5 vs 111.9, coverage 0.068 vs 0.088) and halved sampling time.
+
+#### 1.5 Latent Interpolation Between Synthetic and Training Slices
+![Sample-to-training interpolation](figures/interpolation_sample_to_train.png)
+
+SSIM to the nearest training scan rises gradually along each path (e.g. 0.22 → 0.91), and even the sample closest to the training set starts at only 0.42, so generated slices are not copies of training scans.
 
 ### 2\. Resource Profiling
 
@@ -245,15 +252,15 @@ Furthermore, adding all 4 forms of regularisation together improved generation (
 | 1. Reconstruction SSIM | > 0.6 | 0.917 |
 | 2. Sample NN-SSIM | > 0.2 | 0.229 |
 | 3. Possible copies / near-duplicates | < real rate / 0 | 0.3% vs 1.1% / 0 |
-| 4a. Pairwise SSIM | ±25% of real | 0.148 vs 0.148 (real) |
+| 4a. Pairwise SSIM | ±25% of real | 0.148 vs 0.197 (real) |
 | 4b. Density, coverage | > 50% of real | 40%, 47% |
 | 5. VRAM / time per slice | < 16 GB / < 1 s | 3.3 GB / 0.51 s |
 
-4/5 acceptance criteria were completed by the VQ-VAE, with density and coverage being slightly under the set expectation.
+AC1, AC2, AC3 and AC5 were met by the VQ-VAE; AC4 was not, with pairwise SSIM just outside ±25% of real (25.2% below) and density and coverage being slightly under the set expectation.
 
 #### 4.2 Conclusions
 
-- **Privacy:** There was no evidence of patient memorisation in the VQ-VAE + PixelCNN Prior's generation of synthetic slices which suggests it is
+- **Privacy:** There was no evidence of patient memorisation in the VQ-VAE + PixelCNN Prior's generation of synthetic slices which suggests it is suitable from a privacy perspective
 - **Diversity:** There is reasonable diversity and coverage of generated samples
 - **Fidelity:** Whilst the VQ-VAE + PixelCNN Prior well exceeded the VAE baseline, and was excellent at reconstruction, section 3 shows that some generated synthetic slices were anatomically implausible, showing there are still improvements necessary for synthetic datasets to be as useful as real patient datasets.
 - **vs Baseline**: The additional complexity of the VQ-VAE + PixelCNN Prior is absolutely necessary for synthetic image generation in comparison to VAE, as it resulted in significant improvements in reconstruction and the production of some plausible generated synthetic slices (even if not all were so) in comparison to the VAE which failed to produce any semblance of anatomic fidelity in its generated images.
@@ -283,5 +290,5 @@ All code and comments was verified and empirically tested.
 - Szegedy, C., Vanhoucke, V., Ioffe, S., Shlens, J., & Wojna, Z. (2016). Rethinking the Inception architecture for computer vision. *IEEE Conference on Computer Vision and Pattern Recognition (CVPR)*, 2818–2826.
 - The University of Queensland. (2026). *COMP3710 Pattern Recognition and Analysis: Report specification* (v2.3), Appendix: HipMRI Study for prostate cancer radiotherapy dataset and Appendix B (Nifti loading code).
 - van den Oord, A., Kalchbrenner, N., Vinyals, O., Espeholt, L., Graves, A., & Kavukcuoglu, K. (2016). Conditional image generation with PixelCNN decoders. *Advances in Neural Information Processing Systems, 29*.
-- van den Oord, A., Kalchbrenner, N., Espeholt, L., Kavukcuoglu, K., Vinyals, O., & Graves, A. (2016). Conditional image generation with PixelCNN decoders. *Advances in Neural Information Processing Systems, 29, 4790–4798.*
+- van den Oord, A., Vinyals, O., & Kavukcuoglu, K. (2017). Neural discrete representation learning. *Advances in Neural Information Processing Systems, 30*.
 - Wang, Z., Bovik, A. C., Sheikh, H. R., & Simoncelli, E. P. (2004). Image quality assessment: From error visibility to structural similarity. *IEEE Transactions on Image Processing, 13*(4), 600–612.

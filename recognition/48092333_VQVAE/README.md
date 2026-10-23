@@ -14,7 +14,11 @@ Loss Function:
 \mathcal{L} = \frac{1}{N}\lVert x-\hat{x}\rVert_2^2 + \beta\frac{1}{M}\lVert z_e(x)-\mathrm{sg}[z_q(x)]\rVert_2^2
 ```
 2. **Gated PixelCNN:** learns the distribution of codebook vectors autoregressively and each code is predicted from all codes above it and to its left. Generated synthetic slices are formed by sampling a grid one vector at a time and passing the generated 64 x 32 map through the VQ-VAE decoder.
-3. **VAE:** learns a continuous latent representation by encoding each input into a probability distribution, sampling a latent vector and decoding it to reconstruct the input. Generated samples are formed by sampling and decoding the learnt latent distribution.
+3. **VAE:** learns a continuous latent representation by encoding each input into a probability distribution, sampling a latent vector and decoding it to reconstruct the input. Generated samples are formed by sampling and decoding the learnt latent distribution. In this investigation KL weights of 1, 0.1 and 0.01 were tested to improve baseline performance.
+Loss function:
+```math
+\mathcal{L}_{\text{VAE}} = \frac{1}{N}\lVert x-\hat{x}\rVert_2^2 + \beta D_{\text{KL}}\big(q_\phi(z|x)\,\|\,p(z)\big), \qquad \beta\in\{1,\,0.1,\,0.01\}
+```
 
 ### 3\. Algorithm Visualisation
 
@@ -149,6 +153,19 @@ sbatch slurm/experiments.sbatch     # side experiments: VAE KL optimisation, and
 
 
 ## V Pre-Processing
+
+1. Loaded Nifti slices with Nibabel
+2. Centre-cropped the 60 slices of dimensions 256 x 144 to 256 x 128 to make all 12660 slices have identical dimensions
+3. Normalised each slice by clipping to 0.5th-99.95th percentiles (to ensure outliers don't compress remaining contrast scale), then scaled pixel values to [0,1]. This is because calculating SSIM requires model inputs and output scales must match, as output is sigmoid values, input must be scaled to [0,1].
+4. Left-right mirrored inputs were also randomly sampled to be used for training the PixelCNN prior as overfitting was previously observed.
+5. Ensured that the given training, validation, test split did not contain patient leakage.
+
+| Split | Slices | Patients | 
+|---|---|---|
+| Train | 11,460 | 31 |
+| Validate | 660 | 4 | 
+| Test | 540 | 3 | 
+
 
 ## VI Investigation of the Open Research Dilemma
 

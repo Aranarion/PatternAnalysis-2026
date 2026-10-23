@@ -30,7 +30,7 @@ flowchart LR
     Z -. "training data for prior" .-> P
 ```
 
-## II Feasibility Review
+## II Feasibility Review (23/10)
 
 ### 1 User Need, Scope \& Acceptance Criteria
 
@@ -121,6 +121,22 @@ sbatch slurm/experiments.sbatch     # side experiments: VAE KL optimisation, and
 ```
 
 ## IV Example Inputs, Outputs \& Visual Plots
+
+### 1\. VQ-VAE Training Curves
+![VQ-VAE Curves](figures/vqvae_curves.png)
+
+### 2\. PixelCNN Prior Training Curves
+![PixelCNN Prior Curves](figures/prior_curves_final.png)
+
+### 3\. VAE \& VQ-VAE Reconstructions
+![Reconstructions](figures/reconstructions.png)
+
+### 4\. VQ-VAE Generated Slices
+![VQ-VAE Generated Slices](figures/samples_vqvae.png)
+
+### 5\. VAE Generated Slices
+![VAE Generated Slices](figures/samples_vae.png)
+
 
 ## V Pre-Processing
 

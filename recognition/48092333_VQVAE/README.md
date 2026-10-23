@@ -130,13 +130,13 @@ sbatch slurm/experiments.sbatch     # side experiments: VAE KL optimisation, and
 
 ### 3\. VAE Training Curves 
 #### 3.1 KL 1
-![1 VAE Curves](figures/vae_curves)
+![1 VAE Curves](figures/vae_curves.png)
 
 #### 3.2 KL 0.1
-![0.1 VAE Curves](figures/vae_kl0.1_curves)
+![0.1 VAE Curves](figures/vae_kl0.1_curves.png)
 
 #### 3.3. KL 0.01
-![0.01 VAE Curves](figures/vae_kl0.01_curves)
+![0.01 VAE Curves](figures/vae_kl0.01_curves.png)
 
 ### 4\. VAE \& VQ-VAE Reconstructions
 ![Reconstructions](figures/reconstructions.png)

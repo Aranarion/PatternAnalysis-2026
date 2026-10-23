@@ -10,9 +10,9 @@ Open-source Hip MRI data is scarce due to patient confidentiality laws, however,
 
 1. **VQ-VAE**: (a) The encoder downsamples each 256 x 128 slice into 64 x 32 latent map where each position represents a learnt feature vector. (b) The codebook learns 512 latent vectors where each encoder output is mapped to its closest (by Euclidean distance) codebook vector. Then, each codebook vector is updated by an exponential moving average of the encoder outputs assigned to each specific vector. To stop codebook collapse, the codebook was initialised by encoder outputs and vectors unused for 20 training steps were reinitialised to a random current encoder output. (c) The decoder upsamples the 64 x 32 latent map of codebook vectors to a reconstructed 256 x 128 MRI slice.
 Loss Function:
-$$
-\\mathcal{L} = \\frac{1}{N}\\lVert x-\\hat{x}\\rVert\_2^2 + \\beta\\frac{1}{M}\\lVert z\_e(x)-\\mathrm{sg}\[z\_q(x)]\\rVert\_2^2
-$$
+```math
+\mathcal{L} = \frac{1}{N}\lVert x-\hat{x}\rVert_2^2 + \beta\frac{1}{M}\lVert z_e(x)-\mathrm{sg}[z_q(x)]\rVert_2^2
+```
 2. **Gated PixelCNN:** learns the distribution of codebook vectors autoregressively and each code is predicted from all codes above it and to its left. Generated synthetic slices are formed by sampling a grid one vector at a time and passing the generated 64 x 32 map through the VQ-VAE decoder.
 3. **VAE:** learns a continuous latent representation by encoding each input into a probability distribution, sampling a latent vector and decoding it to reconstruct the input. Generated samples are formed by sampling and decoding the learnt latent distribution.
 
@@ -21,7 +21,7 @@ $$
 ```mermaid
 flowchart LR
     subgraph Stage 1: VQ-VAE reconstruction
-        X["MR slice<br/>256×128"] --> E["Encoder"] --> Q{"Nearest of<br/>512 codes"}
+        X["MRI slice<br/>256×128"] --> E["Encoder"] --> Q{"Nearest of<br/>512 codes"}
         Q --> Z["64×32 code grid"] --> D["Decoder"] --> R["Reconstruction"]
     end
     subgraph Stage 2: generation
@@ -90,6 +90,35 @@ flowchart LR
 * Optimise regularisation of prior and KL weight of VAE. Then train models and evaluate pairwise / nearest neighbour SSIM, diversity, memorisation, and whether model collapse occurs.
 
 ## III Dependencies
+
+### 1\. Packages
+
+| Python | PyTorch | torchvision | nibabel | NumPy | matplotlib | tqdm |
+|---|---|---|---|---|---|---|
+| 3.13.2 | 2.7.0 (CUDA 12.6) | 0.22.0 | 5.4.2 | 2.2.6 | 3.10.3 | 4.67.1 |
+
+Run on Rangpur A100.
+
+### 2\. Reproducibility
+- Fixed seeds: 42 (training), 0 (sampling)
+- Successfully reproduced all metrics (predict.py)
+
+### 3\. Usage
+
+| File | Contents |
+|---|---|
+| `slurm/` | Rangpur scripts |
+| `dataset.py` | Nifti loading, data processing, data audit |
+| `modules.py` | VQ-VAE, VAE, EMA codebook, Gated PixelCNN |
+| `train.py` | Training, validation, checkpointing, produces loss curves |
+| `predict.py` | Tests benchmark, sampling, memorisation, produces figures |
+| `experiments.py` | Prior regularisation, VAE KL optimisation |
+
+```bash
+sbatch slurm/smoke_test.sbatch      # smoke test
+bash slurm/run_all.sh               # trains VAE, VQ-VAE, CNN prior, and runs predict.py
+sbatch slurm/experiments.sbatch     # side experiments: VAE KL optimisation, and prior regularisation
+```
 
 ## IV Example Inputs, Outputs \& Visual Plots
 

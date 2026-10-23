@@ -257,6 +257,7 @@ Furthermore, adding all 4 forms of regularisation together improved generation (
 - **Diversity:** There is reasonable diversity and coverage of generated samples
 - **Fidelity:** Whilst the VQ-VAE + PixelCNN Prior well exceeded the VAE baseline, and was excellent at reconstruction, section 3 shows that some generated synthetic slices were anatomically implausible, showing there are still improvements necessary for synthetic datasets to be as useful as real patient datasets.
 - **vs Baseline**: The additional complexity of the VQ-VAE + PixelCNN Prior is absolutely necessary for synthetic image generation in comparison to VAE, as it resulted in significant improvements in reconstruction and the production of some plausible generated synthetic slices (even if not all were so) in comparison to the VAE which failed to produce any semblance of anatomic fidelity in its generated images.
+- **Extensions**: Experiment further with hierarchical models (e.g. VQ-VAE2) to improve capacity of generative models to produce synthetic slices with realistic anatomical features.
 
 
 ## VII Artificial Intelligence Usage Disclosure
@@ -270,3 +271,17 @@ Anthropic Claude was used for the following:
 - Construction of mermaid algorithm visualisation
 
 All code and comments was verified and empirically tested.
+
+## VIII References
+
+- Dhariwal, P., Jun, H., Payne, C., Kim, J. W., Radford, A., & Sutskever, I. (2020). Jukebox: A generative model for music. *arXiv preprint arXiv:2005.00341*.
+- Heusel, M., Ramsauer, H., Unterthiner, T., Nessler, B., & Hochreiter, S. (2017). GANs trained by a two time-scale update rule converge to a local Nash equilibrium. *Advances in Neural Information Processing Systems, 30*.
+- Kingma, D. P., & Welling, M. (2014). Auto-encoding variational Bayes. *International Conference on Learning Representations (ICLR)*.
+- Loshchilov, I., & Hutter, F. (2019). Decoupled weight decay regularization. *International Conference on Learning Representations (ICLR)*.
+- Naeem, M. F., Oh, S. J., Uh, Y., Choi, Y., & Yoo, J. (2020). Reliable fidelity and diversity metrics for generative models. *International Conference on Machine Learning (ICML)*, 7176–7185.
+- Salimans, T., Karpathy, A., Chen, X., & Kingma, D. P. (2017). PixelCNN++: Improving the PixelCNN with discretized logistic mixture likelihood and other modifications. *International Conference on Learning Representations (ICLR)*.
+- Szegedy, C., Vanhoucke, V., Ioffe, S., Shlens, J., & Wojna, Z. (2016). Rethinking the Inception architecture for computer vision. *IEEE Conference on Computer Vision and Pattern Recognition (CVPR)*, 2818–2826.
+- The University of Queensland. (2026). *COMP3710 Pattern Recognition and Analysis: Report specification* (v2.3), Appendix: HipMRI Study for prostate cancer radiotherapy dataset and Appendix B (Nifti loading code).
+- van den Oord, A., Kalchbrenner, N., Vinyals, O., Espeholt, L., Graves, A., & Kavukcuoglu, K. (2016). Conditional image generation with PixelCNN decoders. *Advances in Neural Information Processing Systems, 29*.
+- van den Oord, A., Kalchbrenner, N., Espeholt, L., Kavukcuoglu, K., Vinyals, O., & Graves, A. (2016). Conditional image generation with PixelCNN decoders. *Advances in Neural Information Processing Systems, 29, 4790–4798.*
+- Wang, Z., Bovik, A. C., Sheikh, H. R., & Simoncelli, E. P. (2004). Image quality assessment: From error visibility to structural similarity. *IEEE Transactions on Image Processing, 13*(4), 600–612.
